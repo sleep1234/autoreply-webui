@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="自动回复"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Minimal text auto-reply for WeChat (com.tencent.mm)" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="true"
+            android:label="自动回复白名单">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+</manifest>

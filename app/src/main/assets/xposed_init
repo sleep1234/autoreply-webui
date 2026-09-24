@@ -1,0 +1,3 @@
+# The assets/xposed_init declares the legacy entry point (de.robv API).
+# This is loaded by frameworks that do not support the modern libxposed API.
+dev.example.autoreply.hook.MainHook
