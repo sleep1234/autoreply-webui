@@ -248,9 +248,9 @@ class WeChatHook(
     // ===================================================================
 
     private fun hookMessageTableInsert() {
-        // WeKit hooks com.tencent.wcdb.database.SQLiteDatabase.insertWithOnConflict
-        // (resolved via reflekt). We do the same, resolving the concrete class
-        // from the host classloader.
+        // Original WeKit-style hook: only insertWithOnConflict on "message" table.
+        // The user confirmed the original repo works on WeChat 8.0.76, so the
+        // message INSERT still goes through this path. Keep it exact.
         runCatching {
             val clazz = Class.forName("com.tencent.wcdb.database.SQLiteDatabase", false, classLoader)
             XposedHelpers.findAndHookMethod(
@@ -260,7 +260,18 @@ class WeChatHook(
                 ContentValues::class.java, Int::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        checkMessageInsert(param.args[0] as String, param.args[2] as ContentValues)
+                        val table = param.args[0] as? String ?: return
+                        val values = param.args[2] as? ContentValues ?: return
+                        // Log ANY table write to diagnose, but only process "message"
+                        if (table != "message") {
+                            if (table.contains("msg") || table.contains("Msg") ||
+                                table.contains("chat") || table.contains("Chat") ||
+                                table == "rconversation" || table == "oplog2") {
+                                log("WCDB insert table='$table' (ignored)")
+                            }
+                            return
+                        }
+                        checkMessageInsert(table, values)
                     }
                 }
             )

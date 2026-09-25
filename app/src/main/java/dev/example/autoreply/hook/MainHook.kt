@@ -5,6 +5,10 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import dev.example.autoreply.ctwing.CtwingIpcBridge
+import dev.example.autoreply.ctwing.CtwingKeywordRouter
+import dev.example.autoreply.ctwing.CtwingNetworkHook
+import dev.example.autoreply.ctwing.CtwingWebViewHook
 import dev.example.autoreply.trigger.BufferedMessageTrigger
 import dev.example.autoreply.trigger.MessageTrigger
 import dev.example.autoreply.ui.WhitelistStore
@@ -22,31 +26,62 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
         modulePath = startupParam.modulePath
+        TinkerGuard.hookClassLoaderFilter(startupParam)
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.tencent.mm") return
-        if (!lpparam.isFirstApplication) return
 
-        XposedBridge.log("[AutoReply] WeChat main process started. Initializing…")
+        val processName = lpparam.processName ?: "unknown"
+        val isMain = processName == "com.tencent.mm"
 
-        // Wipe Tinker hot-update patch before it loads. Tinker silently replaces
-        // DEX classes (including WCDB) when the patch dir exists, which breaks
-        // all message-table hooks. This runs in the main process, before WeChat
-        // fully initializes, so no stale DEX is loaded.
-        runCatching {
-            val tinkerDir = java.io.File(lpparam.appInfo.dataDir, "tinker")
-            if (tinkerDir.exists()) {
-                tinkerDir.deleteRecursively()
-                XposedBridge.log("[AutoReply] Tinker patch directory deleted")
-            } else {
-                XposedBridge.log("[AutoReply] No Tinker patch found")
-            }
+        // ---- CTWing WebView hook: main + xweb processes ----
+        // H5 pages (MMWebViewUI) load in the main process, but the X5/XWeb
+        // WebView kernel (com.tencent.xweb) may call loadUrl from the
+        // xweb_privileged_process_0 / xweb_sandboxed_process_0 processes.
+        // We install the lightweight WebView hook (no native lib) in ALL
+        // these processes so we catch the CTWing URL regardless of which
+        // process performs the load.
+        val isWebViewProcess = isMain ||
+            processName.contains("xweb") ||
+            processName.contains("tools")
+
+        if (isWebViewProcess) {
+            runCatching {
+                CtwingWebViewHook.hook(lpparam.classLoader)
+                XposedBridge.log("[AutoReply] CTWing WebView hook installed ($processName)")
+            }.onFailure { XposedBridge.log("[AutoReply] CTWing WebView hook FAILED ($processName): ${it.message}") }
+
+            runCatching {
+                CtwingNetworkHook.hook(lpparam.classLoader)
+                XposedBridge.log("[AutoReply] CTWing Network hook installed ($processName)")
+            }.onFailure { XposedBridge.log("[AutoReply] CTWing Network hook FAILED ($processName): ${it.message}") }
+        }
+
+        // ---- Engine (DexKit + TinkerGuard + message): MAIN process ONLY ----
+        // DexKit's native lib crashes if loaded from multiple processes.
+        if (!isMain) {
+            XposedBridge.log("[AutoReply] skip process=$processName (non-main, webview-hook=${isWebViewProcess})")
+            return
+        }
+
+        XposedBridge.log("[AutoReply] process=$processName (main, engine init)")
+
+        // --- TinkerGuard ---
+        try {
+            TinkerGuard.wipePatchDirs(lpparam.appInfo.dataDir)
+            TinkerGuard.hookTinkerApi(lpparam.classLoader)
+        } catch (e: Exception) {
+            XposedBridge.log("[AutoReply] TinkerGuard FAILED: ${e.message}")
         }
 
         loadNativeLibrary(lpparam)
+        CtwingIpcBridge.wechatDataDir = lpparam.appInfo.dataDir
 
-        // ---- Keyword match reply (no LLM needed) ----
+        // ---- WeChat message capture + send ----
+        val hook = WeChatHook(lpparam.classLoader)
+
+        // ---- Keyword match reply engine ----
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val trigger = MessageTrigger(
             contentRegex = null,
@@ -66,34 +101,50 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
             val text = content.replaceFirst(Regex("^wxid_\\w+:"), "").trim()
             XposedBridge.log("[AutoReply] onFlush: talker=$talker text=$text")
 
-            // Record this talker so the settings UI can show it for whitelist selection
             val isGroup = talker.endsWith("@chatroom")
             runCatching { WhitelistStore.addSeenTalker(talker, talker, isGroup) }
 
-            // Whitelist check: if non-empty, only reply to listed talkers
             val whitelist = WhitelistStore.list()
             if (whitelist.isNotEmpty() && whitelist.none { target.talker == it.id }) {
                 XposedBridge.log("[AutoReply] skipped: talker=$talker not in whitelist")
                 return@BufferedMessageTrigger
             }
 
+            // ---- CTWing keyword routing ----
+            val ctwHandled = CtwingKeywordRouter.tryHandle(target) { replyText ->
+                val delayMs = (2_000L..5_000L).random()
+                XposedBridge.log("[AutoReply] CTWing delay ${delayMs}ms")
+                kotlinx.coroutines.delay(delayMs)
+                XposedBridge.log("[AutoReply] CTWing reply: $replyText")
+                hook.sendText(talker, replyText)
+            }
+            if (ctwHandled) return@BufferedMessageTrigger
+
+            // ---- Fallback keyword replies ----
             val reply = when {
                 text.contains("在吗") -> "在的，自动回复"
-                else -> "已收到：「$text」——这是自动回复 🤖"
+                text.contains("帮助") || text.contains("help") -> """
+                    🤖 自动回复帮助：
+                    · 查询 <ICCID> — 查询卡基本信息
+                    · 诊断 <ICCID> — 智能诊断
+                    · 重绑 <ICCID> <IMEI> — 机卡重绑
+                    · 环境 — 诊断 SPA 环境（调试用）
+                    · 在吗 — 测试自动回复
+                """.trimIndent()
+                else -> "已收到：「$text」——这是自动回复 🤖\n发送「帮助」查看可用命令"
             }
 
-            // 防风控：随机延迟 2~5 秒再发送，模拟真人回复节奏
             val delayMs = (2_000L..5_000L).random()
             XposedBridge.log("[AutoReply] delaying ${delayMs}ms before reply")
             kotlinx.coroutines.delay(delayMs)
 
-            XposedBridge.log("[AutoReply] sending reply: $reply")
+            XposedBridge.log("[AutoReply] sending reply: ${reply.take(60)}…")
             hook.sendText(talker, reply)
         }
 
         hook.onEnable()
         hook.addInsertListener(buffer)
-        XposedBridge.log("[AutoReply] Keyword reply engine started. Waiting for messages…")
+        XposedBridge.log("[AutoReply] Engine started. Waiting for messages…")
     }
 
     @Suppress("UnsafeDynamicallyLoadedCode")
