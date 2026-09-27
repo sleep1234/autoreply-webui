@@ -2,6 +2,7 @@ package dev.example.autoreply.ctwing
 
 import de.robv.android.xposed.XposedBridge
 import dev.example.autoreply.hook.IncomingMessage
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Routes incoming WeChat messages to CTWing operations.
@@ -35,33 +36,104 @@ object CtwingKeywordRouter {
      */
     suspend fun tryHandle(msg: IncomingMessage, send: suspend (String) -> Unit): Boolean {
         val raw = msg.content ?: return false
-        val content = raw.trim()
+        // 群聊消息 content 格式为 "发送者wxid:@昵称 正文"，剥离前缀再匹配关键词
+        var content = raw.replaceFirst(Regex("^wxid_\\w+:"), "").trim()
+        // 剥离群聊 @ 前缀：@昵称 后面是特殊空格（U+2005/U+0020）
+        content = content.replaceFirst(Regex("^@\\S+[\\s\u2005]+"), "").trim()
         if (content.isEmpty()) return false
 
         val lower = content.lowercase()
 
         val op = when {
-            lower.startsWith("诊断环境") || lower.startsWith("dump") || lower.startsWith("环境") -> "dump"
-            lower.startsWith("加密侦察") || lower.startsWith("recon") -> "recon"
+            lower.startsWith("界面") || lower.startsWith("uidump") || lower.startsWith("ui") -> "uiDump"
+            lower.startsWith("发现") || lower.startsWith("discover") -> "discover"
+            lower.startsWith("取凭证") || lower.startsWith("credential") -> "credential"
+            lower.startsWith("捕获") || lower.startsWith("capture") -> "capture"
             lower.startsWith("侦察报告") || lower.startsWith("reconreport") -> "reconReport"
+            lower.startsWith("加密侦察") || lower.startsWith("recon") -> "recon"
             lower.startsWith("重绑") || lower.startsWith("rebind") -> "rebind"
             lower.startsWith("诊断") || lower.startsWith("diagnose") -> "diagnose"
             lower.startsWith("查询") || lower.startsWith("查卡") || lower.startsWith("query") -> "query"
             else -> return false
         }
 
-        if (!CtwingFacade.isReady()) {
-            send("⚠️ CTWing 服务未就绪（请先打开物联网卡 H5 页面并登录）")
+        // NOTE: query/diagnose try native HTTP FIRST (no WebView needed),
+        // then fall back to WebView via ensureReady. The global guard below
+        // is only for UI-dump/discover/recon commands that need a live WebView.
+
+        // ---- UI dump: no ICCID needed ----
+        if (op == "uiDump") {
+            try {
+                val ui = CtwingFacade.uiDump()
+                send("📱 界面结构：\n${ui.take(2000)}")
+            } catch (e: Exception) {
+                send("❌ UI dump失败：${e.message}")
+            }
             return true
         }
 
         // ---- Diagnostic dump: no ICCID needed ----
-        if (op == "dump") {
+        if (op == "discover") {
             try {
-                val surface = CtwingFacade.dump()
-                send("🔍 SPA 环境：\n${surface.take(600)}")
+                val surface = CtwingFacade.discover()
+                send("🔍 服务发现：\n${surface.take(1500)}")
             } catch (e: Exception) {
-                send("❌ 诊断失败：${e.message}")
+                send("❌ 发现失败：${e.message}")
+            }
+            return true
+        }
+
+        // ---- Crypto recon: no ICCID needed ----
+        if (op == "recon") {
+            try {
+                val scan = CtwingFacade.recon()
+                send("🔐 加密侦察：\n${scan.take(1500)}")
+            } catch (e: Exception) {
+                send("❌ 侦察失败：${e.message}")
+            }
+            return true
+        }
+
+        if (op == "reconReport") {
+            try {
+                val report = CtwingFacade.reconReport()
+                send("🔐 侦察报告：\n${report.take(1500)}")
+            } catch (e: Exception) {
+                send("❌ 报告失败：${e.message}")
+            }
+            return true
+        }
+
+        // credential needs NO identifier — handle before the ICCID check.
+        if (op == "credential") {
+            try {
+                val creds = CtwingFacade.extractCredentials()
+                // Save to WeChat data dir for offline use
+                try {
+                    val dir = java.io.File(CtwingIpcBridge.wechatDataDir, "dsh_ctwing_bundles")
+                    dir.mkdirs()
+                    java.io.File(dir, "credentials.json").writeText(creds)
+                    XposedBridge.log("$TAG credentials saved to credentials.json")
+                } catch (e: Exception) {
+                    XposedBridge.log("$TAG cred save failed: ${e.message}")
+                }
+                send("🔐 凭证：\n${creds.take(1500)}")
+            } catch (e: Exception) {
+                send("❌ 取凭证失败：${e.message}")
+            }
+            return true
+        }
+
+        // capture needs NO identifier — handle it before the ICCID check.
+        if (op == "capture") {
+            try {
+                // Trigger a queryCard to force sbu1 encryption, then read recon state
+                CtwingFacade.queryCard("89860620140020723456")
+                kotlinx.coroutines.delay(5_000L)
+                val report = CtwingFacade.reconReport()
+                send("🔑 密钥捕获结果：\n${report.take(1500)}")
+            } catch (e: Exception) {
+                send("❌ 捕获失败：${e.message}")
             }
             return true
         }
@@ -76,34 +148,138 @@ object CtwingKeywordRouter {
         }
 
         try {
+            CtwingFacade.webViewMutex.withLock {
             when (op) {
                 "query" -> {
-                    // UI automation: fill input + click button → SPA's own
-                    // pipeline fires → captured plaintext flows back through
-                    // the same callJs return (local or IPC).
-                    val r = CtwingFacade.uiQuery(iccid)
-                    if (r.isNotBlank() && !isCiphertext(r) && !r.startsWith("{")) {
-                        // uiQuery returns a plaintext placeholder normally;
-                        // if the SPA actually returned data, use it.
-                        send(formatCardInfo(r))
-                    } else {
-                        send("✅ 已在 H5 页面发起查询 ICCID=$iccid。\n请在 H5 界面确认结果；若未显示请查看 logcat [CTWing-Bridge][api-capture]。")
+                    kotlinx.coroutines.delay(2_000L)
+                    CtwingFacade.pullToken()
+                    val token = NativeHttp.cachedToken ?: ""
+                    val idType = inferType(iccid)
+                    val raw = runCatching {
+                        NativeHttp.queryCard(token, idType, iccid)
+                    }.getOrElse { e ->
+                        XposedBridge.log("$TAG query NativeHttp failed: ${e.message}")
+                        null
                     }
+                    CtwingFacade.releaseWakeLock()
+                    val bestResp = raw?.let { extractBestResponse(it) }
+                    if (bestResp != null) send(formatCardInfo(bestResp))
+                    else send("⚠️ 查询未完成：${(raw ?: "null").take(120)}")
                 }
                 "diagnose" -> {
-                    val r = CtwingFacade.diagnose(iccid)
-                    send(formatDiagnosis(r))
+                    val token = NativeHttp.cachedToken ?: ""
+                    val idType = inferType(iccid)
+                    val raw = runCatching {
+                        NativeHttp.diagnose(token, idType, iccid)
+                    }.getOrElse { e ->
+                        XposedBridge.log("$TAG diagnose NativeHttp failed: ${e.message}")
+                        null
+                    }
+                    CtwingFacade.releaseWakeLock()
+                    val bestResp = raw?.let { extractBestResponse(it) }
+                    if (bestResp != null) send(formatDiagnosis(bestResp))
+                    else send("⚠️ 诊断超时：${(raw ?: "null").take(120)}")
                 }
                 "rebind" -> {
-                    val imei = IMEI_REGEX.find(content)?.value
-                    if (imei == null) {
-                        send("请提供 IMEI（15 位数字），例如：重绑 $iccid 866123456789012")
-                        return true
+                    send("🔄 正在提交重绑…")
+                    CtwingFacade.pullToken()
+                    val idType = inferType(iccid)
+                    val payload = org.json.JSONObject().apply {
+                        put("type", idType)
+                        put("id", iccid)
+                        put("imei", "")
+                        put("source", "其他")
+                        put("orderNumber", "")
+                        put("sessionId", "")
+                        put("comment", "")
+                        put("bindType", "")
+                        put("file", org.json.JSONObject().put("ids", org.json.JSONArray()))
+                        put("operation", "JKCB")
+                    }.toString()
+                    XposedBridge.log("$TAG operationCommit: $payload")
+                    // POST 需要浏览器 CSRF 上下文，用 WebView XHR 而非 NativeHttp
+                    CtwingFacade.operationCommit(payload)
+
+                    var raw: String = "null"
+                    for (round in 1..15) {
+                        kotlinx.coroutines.delay(1_000L)
+                        raw = CtwingFacade.pollDshResult()
+                        if (raw.contains("operationCommit-ok") || raw.contains("operationCommit-err")) break
+                        if (raw.length > 20 && raw != "null") break  // got real data
                     }
-                    val r = CtwingFacade.rebind(iccid, imei)
-                    send(formatRebind(r))
+                    CtwingFacade.releaseWakeLock()
+
+                    XposedBridge.log("$TAG rebind raw(${raw.length}): ${raw.take(600)}")
+                    val resultText = try {
+                        var cur: Any = raw.trim()
+                        var guard = 0
+                        while (cur is String && guard < 6) {
+                            val t = cur.trim()
+                            if (!(t.startsWith("\"") || t.startsWith("{"))) break
+                            cur = org.json.JSONTokener(t).nextValue()
+                            guard++
+                        }
+                        val wrap = cur as? org.json.JSONObject ?: throw RuntimeException("not object after $guard peels")
+                        // NativeHttp 返回原始 JSON（无 {status,body} 包装），直接作为 body
+                        // 旧格式：{status:200, body:"{...}"} → 提取 body 字段
+                        val bj: org.json.JSONObject? = when {
+                            wrap.has("status") && wrap.has("body") -> {
+                                val bodyTok = wrap.opt("body")
+                                when (bodyTok) {
+                                    is org.json.JSONObject -> bodyTok
+                                    is String -> {
+                                        var b: Any = bodyTok; var g2 = 0
+                                        while (b is String && g2 < 6) {
+                                            val bt = b.trim()
+                                            if (!(bt.startsWith("\"") || bt.startsWith("{"))) break
+                                            b = org.json.JSONTokener(bt).nextValue(); g2++
+                                        }
+                                        b as? org.json.JSONObject
+                                    }
+                                    else -> null
+                                }
+                            }
+                            else -> wrap // NativeHttp raw format
+                        }
+                        if (bj == null) throw RuntimeException("no body obj")
+                        val bcode = bj.optInt("code", -1)
+                        val bdata = bj.optJSONObject("data")
+                        val opStatus = bdata?.optString("status", "") ?: ""
+                        val remark = bdata?.optString("remark", "") ?: ""
+                        val workId = bdata?.optString("id", "") ?: ""
+
+                        when {
+                            bcode == 401 ->
+                                "⚠️ 重绑失败：未登录，token 已过期"
+                            bcode != 0 ->
+                                "❌ 重绑失败：${bj.optString("msg", "code=$bcode")}"
+                            opStatus.contains("成功") -> {
+                                val sb = StringBuilder("✅ 机卡重绑成功")
+                                if (workId.isNotBlank()) sb.append("（工单：$workId）")
+                                if (remark.isNotBlank()) sb.append("\n$remark")
+                                sb.toString()
+                            }
+                            opStatus.contains("失败") -> {
+                                val sb = StringBuilder("❌ 机卡重绑失败")
+                                if (remark.isNotBlank()) sb.append("：$remark")
+                                sb.toString()
+                            }
+                            else -> {
+                                val sb = StringBuilder("✅ 机卡重绑已提交")
+                                if (workId.isNotBlank()) sb.append("（工单：$workId）")
+                                sb.append("\n⏳ 处理结果请稍后查询")
+                                sb.toString()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        XposedBridge.log("$TAG rebind parse failed: ${e.message}")
+                        if (raw.contains("\"code\":0")) "✅ 机卡重绑已提交成功"
+                        else "📋 重绑提交结果：\n${raw.take(300)}"
+                    }
+                    send(resultText)
                 }
             }
+            } // withLock
             return true
         } catch (e: Exception) {
             XposedBridge.log("$TAG op=$op failed: ${e.message}")
@@ -120,38 +296,321 @@ object CtwingKeywordRouter {
     private fun isCiphertext(s: String): Boolean =
         s.isNotEmpty() && (s[0] == '\u001e' || s.contains("CTROBF"))
 
-    private fun formatCardInfo(json: String): String {
-        if (isCiphertext(json)) return "⚠️ 返回密文（CTROBF1），尚未解密。当前为诊断模式，请查看 logcat 的 [diag] 日志以确定 SPA 真实请求机制。"
+    /** Infer card id type: msisdn (1x 11-13 digits), imsi (15 digits), else iccid. */
+    private fun inferType(id: String): String {
+        var normalized = id
+        if (normalized.length == 20 && normalized[0] == '8') normalized = normalized.substring(0, 19)
+        return when {
+            Regex("^1[0-9]{10,12}$").matches(normalized) -> "msisdn"
+            Regex("^\\d{15}$").matches(normalized) -> "imsi"
+            else -> "iccid"
+        }
+    }
+
+    /**
+     * Parse readApiResponses() JSON and return the most likely card-info body.
+     * Prefers a JSON response (200) whose body is an object/array; skips
+     * the 403 anti-bot HTML page.
+     */
+    private fun extractBestResponse(raw: String): String? {
+        return try {
+            var json = raw.trim()
+            if (json.startsWith("\"") && json.endsWith("\"")) {
+                json = json.substring(1, json.length - 1)
+            }
+            json = json.replace("\\\"", "\"")
+            XposedBridge.log("$TAG extractBestResponse json.len=${json.length}")
+            val root = org.json.JSONObject(json)
+            // Sync-XHR wrapper: {status: 200, body: "{...}"} — extract body field
+            val bodyStr = root.optString("body", "")
+            if (bodyStr.isNotBlank() && bodyStr.length > 10) {
+                XposedBridge.log("$TAG extractBestResponse body.len=${bodyStr.length}")
+                return bodyStr
+            }
+            // Old format: {data, diag, dom}
+            val data = root.optJSONObject("data")
+            if (data != null) {
+                XposedBridge.log("$TAG extractBestResponse data OK")
+                return data.toString()
+            }
+            val diag = root.optString("diag", "")
+            if (diag.isNotBlank() && diag != "null") {
+                XposedBridge.log("$TAG extractBestResponse diag.len=${diag.length}")
+                return diag
+            }
+            val dom = root.optString("dom", "")
+            XposedBridge.log("$TAG extractBestResponse dom.len=${dom.length}")
+            if (dom.isNotBlank() && !dom.startsWith("no-root")) dom else null
+        } catch (e: Exception) {
+            XposedBridge.log("$TAG extractBestResponse failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun formatCardInfo(text: String): String {
+        if (isCiphertext(text)) return "⚠️ 返回密文（CTROBF1），尚未解密。"
+        if (text.contains(" | ") && !text.trimStart().startsWith("{")) {
+            val sb = StringBuilder("📱 卡信息\n")
+            for (part in text.split(" | ")) {
+                if (part.isNotBlank()) sb.append("· $part\n")
+            }
+            return sb.toString().trimEnd('\n')
+        }
         return runCatching {
-            val sb = StringBuilder("📱 卡信息：\n")
-            val obj = org.json.JSONObject(json)
-            fun pick(vararg keys: String): String? {
-                for (k in keys) if (obj.has(k)) return obj.opt(k)?.toString()
+            val root = org.json.JSONObject(text)
+            val data = root.optJSONObject("data") ?: root
+            val bio = data.optJSONObject("simBasicInfoRespVO") ?: data
+
+            fun v(keys: String): String? {
+                for (k in keys.split("|")) {
+                    val x = bio.optString(k.trim(), "")
+                    if (x.isNotBlank() && x != "null" && x != "-") return x
+                }
                 return null
             }
-            pick("iccid")?.let { sb.append("ICCID：$it\n") }
-            pick("msisdn", "msisdnNumber")?.let { sb.append("MSISDN：$it\n") }
-            pick("status", "simStatus")?.let { sb.append("状态：$it\n") }
-            pick("imei")?.let { sb.append("IMEI：$it\n") }
-            pick("operator", "carrier")?.let { sb.append("运营商：$it\n") }
+
+            val sb = StringBuilder()
+
+            // ---- 客户 & 产品 ----
+            val cust = v("custName")
+            val product = v("productName")
+            sb.append("📱 查询结果")
+            if (cust != null) sb.append(" · $cust")
+            if (product != null) sb.append(" · $product")
+            sb.append("\n")
+
+            // ---- 卡标识 ----
+            line("接入号", v("msisdn|searchText"), sb)
+            line("ICCID",  v("iccid"), sb)
+            line("IMSI",   v("imsi"), sb)
+            line("归属",   v("commonRegionName"), sb)
+            data.optJSONObject("machineRebind")?.let { mr ->
+                val bimei = mr.optString("bindImei", "")
+                if (bimei.isNotBlank() && bimei != "null") line("绑定IMEI", bimei, sb)
+                val lastImei = mr.optString("lastImei", "")
+                if (lastImei.isNotBlank() && lastImei != "null") line("当前IMEI", lastImei, sb)
+            }
+
+            // ---- 卡状态 ----
+            data.optJSONArray("scardMainStatusDOS")?.let { arr ->
+                if (arr.length() > 0) {
+                    val items = mutableListOf<String>()
+                    for (j in 0 until arr.length()) {
+                        val item = arr.optJSONObject(j) ?: continue
+                        val proj = item.optString("project", item.optString("name", ""))
+                        val concl = item.optString("operatorDefinitionStatusName", item.optString("conclusion", ""))
+                        if (proj.isNotBlank() || concl.isNotBlank()) {
+                            items.add(if (proj.isNotBlank()) "$proj $concl" else concl)
+                        }
+                    }
+                    if (items.isNotEmpty()) sb.append("SIM状态：${items.joinToString("；")}\n")
+                }
+            }
+
+            // ---- 激活 & 网络 ----
+            line("激活方式", v("activeWay"), sb)
+            line("激活时间", v("activationTime|servActiveDate"), sb)
+            line("生效时间", v("effectiveTime|servCreateDate"), sb)
+            line("网络制式", v("networkType"), sb)
+            line("APN/DNN",  v("apnName"), sb)
+            line("断网状态", v("netBlockStatusName"), sb)
+            line("断网类型", v("blockTypeName"), sb)
+            line("卡形态",   v("cardPhysical"), sb)
+            line("号码池",   v("poolNum"), sb)
+            line("绑定类型", v("bindTypeName"), sb)
+
+            // ---- 在线状态 ----
+            data.optJSONObject("onlineStatus")?.let { os ->
+                val parts = mutableListOf<String>()
+                if (os.optString("onlineStatus", "0") == "1") parts.add("在线") else parts.add("离线")
+                fun p(k: String, label: String) {
+                    val x = os.optString(k, "")
+                    if (x.isNotBlank() && x != "null") parts.add("$label $x")
+                }
+                p("ipv4Address", "IP")
+                p("provName", "接入省")
+                p("eventTime", "最近上线")
+                if (parts.isNotEmpty()) sb.append("📶 ${parts.joinToString(" · ")}\n")
+            }
+
+            // ---- 机卡绑定详情 ----
+            data.optJSONObject("machineRebind")?.let { mr ->
+                val bc = mr.optString("conclusion", "")
+                val ji = mr.optString("judgment", "")
+                if (bc.isNotBlank() && bc != "null") {
+                    sb.append("机卡绑定：$bc\n")
+                    if (ji.isNotBlank() && ji != "0" && ji != "null") {
+                        appendJudgment(ji, sb)
+                    }
+                }
+            }
+
             sb.toString().trimEnd('\n')
         }.getOrElse {
-            if (json.length > 500) "📱 查询结果（截断）：\n${json.take(500)}…" else "📱 查询结果：\n$json"
+            if (text.length > 500) "📱 查询结果（截断）：\n${text.take(500)}…" else "📱 查询结果：\n$text"
+        }
+    }
+
+    // ==================================================================
+    //  共用排版辅助
+    // ==================================================================
+
+    /** 长值智能换行：含分号或逗号且 >50 字符时，两两一组换行。 */
+    private fun wrapLongValue(label: String, value: String, sb: StringBuilder) {
+        val sep = when {
+            value.contains(";") -> ";"
+            value.contains(",") && value.length > 60 -> ","
+            else -> null
+        }
+        if (sep == null) {
+            sb.append("$label：$value\n")
+            return
+        }
+        val parts = value.split(sep).map { it.trim() }.filter { it.isNotBlank() }
+        sb.append("$label：\n")
+        var i = 0
+        while (i < parts.size) {
+            if (i + 1 < parts.size) {
+                sb.append("  ${parts[i]}$sep${parts[i + 1]}\n")
+                i += 2
+            } else {
+                sb.append("  ${parts[i]}\n")
+                i++
+            }
+        }
+    }
+
+    /** 单字段一行，若为 null 则跳过。 */
+    private fun line(label: String, value: String?, sb: StringBuilder) {
+        if (value == null) return
+        wrapLongValue(label, value, sb)
+    }
+
+    /** 诊断项 judgment：<br/> 直接换行，分号两两一行。 */
+    private fun appendJudgment(text: String, sb: StringBuilder) {
+        // 1. <br/> / <br> → 真实换行（每条信息一行）
+        val withNewlines = text.replace("<br/>", "\n").replace("<br>", "\n")
+        // 2. 逐行处理：行内若还含分号，再两两一组拆分
+        for (rawLine in withNewlines.split("\n")) {
+            val lineText = rawLine.trim()
+            if (lineText.isBlank()) continue
+            if (lineText.contains(";")) {
+                val parts = lineText.split(";").map { it.trim() }.filter { it.isNotBlank() }
+                var i = 0
+                while (i < parts.size) {
+                    if (i + 1 < parts.size) {
+                        sb.append("  ${parts[i]}；${parts[i + 1]}\n")
+                        i += 2
+                    } else {
+                        sb.append("  ${parts[i]}\n")
+                        i++
+                    }
+                }
+            } else {
+                sb.append("  $lineText\n")
+            }
         }
     }
 
     private fun formatDiagnosis(json: String): String {
+        XposedBridge.log("$TAG formatDiagnosis input(${json.length}): ${json.take(800)}")
         if (isCiphertext(json)) return "⚠️ 诊断结果返回密文，尚未解密。"
         return runCatching {
-            val sb = StringBuilder("🔍 诊断结果：\n")
-            val obj = org.json.JSONObject(json)
-            val diagnosis = obj.optString("diagnosis", "")
-            val summary = obj.optString("summary", obj.optString("result", ""))
-            if (diagnosis.isNotBlank()) sb.append(diagnosis)
-            else if (summary.isNotBlank()) sb.append(summary)
-            else sb.append(json.take(500))
-            sb.toString()
-        }.getOrElse { "🔍 诊断结果：\n${json.take(500)}" }
+            val data = org.json.JSONObject(json)
+            val sb = StringBuilder()
+
+            // ---- header: 基础信息在 simBasicInfoRespVO 里 ----
+            val bi = data.optJSONObject("simBasicInfoRespVO")
+            val cust = bi?.optString("custName", "") ?: ""
+            val product = bi?.optString("productName", "") ?: ""
+            sb.append("🔍 诊断报告")
+            if (cust.isNotBlank()) sb.append(" · $cust")
+            if (product.isNotBlank()) sb.append(" · $product")
+            sb.append("\n")
+
+            // ---- 诊断项：networkDisconnect / machineRebind / selfNetworkDisConnect / areaLimit / black ----
+            // 每个都是 {project, conclusion, judgment, recommendations, status}
+            val diagKeys = listOf("networkDisconnect", "machineRebind", "selfNetworkDisConnect", "areaLimit", "black")
+            var hasDiag = false
+            for (key in diagKeys) {
+                val item = data.optJSONObject(key) ?: continue
+                val project = item.optString("project", "")
+                if (project.isBlank()) continue
+                hasDiag = true
+                val icon = when (item.optString("status", "")) {
+                    "绿色" -> "✅"
+                    "红色" -> "❌"
+                    "橙色" -> "⚠️"
+                    else -> "·"
+                }
+                val conclusion = item.optString("conclusion", "—")
+                sb.append("$icon $project：$conclusion\n")
+                val judgment = item.optString("judgment", "")
+                if (judgment.isNotBlank() && judgment != "0" && judgment != "null") {
+                    appendJudgment(judgment, sb)
+                }
+                val rec = item.optString("recommendations", "")
+                if (rec.isNotBlank() && rec != "无" && rec != "null") {
+                    sb.append("  💡 $rec\n")
+                }
+            }
+
+            // ---- SIM 卡状态数组 (scardMainStatusDOS) ----
+            data.optJSONArray("scardMainStatusDOS")?.let { arr ->
+                for (j in 0 until arr.length()) {
+                    val item = arr.optJSONObject(j) ?: continue
+                    val project = item.optString("project", "")
+                    if (project.isBlank()) continue
+                    hasDiag = true
+                    val icon = when (item.optString("status", "")) {
+                        "绿色" -> "✅"
+                        "红色" -> "❌"
+                        "橙色" -> "⚠️"
+                        else -> "·"
+                    }
+                    val conclusion = item.optString("operatorDefinitionStatusName", item.optString("conclusion", "—"))
+                    sb.append("$icon $project：$conclusion\n")
+                    val judgment = item.optString("judgment", "")
+                    if (judgment.isNotBlank() && judgment != "0" && judgment != "null") {
+                        appendJudgment(judgment, sb)
+                    }
+                }
+            }
+            if (!hasDiag) sb.append("无诊断项\n")
+
+            // ---- 卡标识 ----
+            line("接入号", data.optString("msisdn", "").ifBlank { null }, sb)
+            line("ICCID", data.optString("iccid", "").ifBlank { null }, sb)
+            line("IMSI", data.optString("imsi", "").ifBlank { null }, sb)
+            bi?.let {
+                line("归属", it.optString("commonRegionName", "").ifBlank { null }, sb)
+            }
+
+            // ---- 在线状态 ----
+            data.optJSONObject("onlineStatus")?.let { os ->
+                val parts = mutableListOf<String>()
+                fun o(k: String, label: String?) {
+                    val v = os.optString(k, "")
+                    if (v.isNotBlank() && v != "null") parts.add(if (label != null) "$label $v" else v)
+                }
+                if (os.optString("onlineStatus", "0") == "1") parts.add("在线") else parts.add("离线")
+                o("ipv4Address", "IP")
+                o("apnName", "APN")
+                o("provName", "接入省")
+                o("eventTime", "最近上线")
+                if (parts.isNotEmpty()) sb.append("📶 ${parts.joinToString(" · ")}\n")
+            }
+
+            sb.toString().trimEnd('\n')
+        }.getOrElse {
+            if (json.contains(" | ") && !json.trimStart().startsWith("{")) {
+                val sb = StringBuilder("🔍 诊断结果：\n")
+                for (part in json.split(" | ")) if (part.isNotBlank()) sb.append("· $part\n")
+                sb.toString().trimEnd('\n')
+            } else {
+                "🔍 诊断结果：\n${json.take(500)}"
+            }
+        }
     }
 
     private fun formatRebind(json: String): String {

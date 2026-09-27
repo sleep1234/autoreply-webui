@@ -1,32 +1,22 @@
 package dev.example.autoreply.ctwing
 
+import android.os.Environment
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Hooks WeChat's okhttp network layer to capture CTWing traffic.
- *
- * The H5 runs inside WeChat's WebView, whose HTTP requests are ultimately
- * performed by WeChat's own okhttp instance (the same stack the WebView
- * proxy uses). By hooking okhttp3 `RealCall.execute` / `Call.enqueue`, we
- * can observe:
- *
- *   - the request URL + headers (captures Authorization / Cookie credentials)
- *   - the response body (which, at this layer, is the CTROBF1 ciphertext for
- *     API responses — but we still capture it for offline analysis)
- *
- * This complements [CtwingWebViewHook], which captures the *decrypted*
- * plaintext by injecting JS into the WebView. Together they give us both
- * the credentials and the plaintext API data.
+ * Hooks WeChat's network layer to capture CTWing traffic and dump SPA bundles.
  */
 object CtwingNetworkHook {
 
     private const val TAG = "[CTWing-Net]"
     private const val CTWING_HOST = "tywlonestop.ctwing.cn"
 
-    /** Callback invoked with each intercepted CTWing request/response pair. */
+    private val savedUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     interface Listener {
         fun onCtwingRequest(method: String, url: String, headers: Map<String, String>, body: String?)
         fun onCtwingResponse(url: String, status: Int, body: String?)
@@ -45,7 +35,6 @@ object CtwingNetworkHook {
         runCatching {
             val realCall = XposedHelpers.findClass("okhttp3.RealCall", classLoader)
 
-            // ---- execute (synchronous) ----
             XposedHelpers.findAndHookMethod(
                 realCall, "execute",
                 object : XC_MethodHook() {
@@ -56,10 +45,6 @@ object CtwingNetworkHook {
             )
             log("hooked okhttp3.RealCall.execute")
 
-            // ---- enqueue (async, callback path) ----
-            val callbacks = realCall.declaredClasses
-            // WeChat uses the async path heavily; hooking `getResponseWithInterceptorChain`
-            // is more robust than enqueue because it's called by both paths.
             XposedHelpers.findAndHookMethod(
                 realCall, "getResponseWithInterceptorChain",
                 object : XC_MethodHook() {
@@ -69,7 +54,76 @@ object CtwingNetworkHook {
                 }
             )
             log("hooked okhttp3.RealCall.getResponseWithInterceptorChain")
-        }.onFailure { log("hook failed: ${it.message}") }
+        }.onFailure { log("okhttp hook failed: ${it.message}") }
+
+        // ---- Fallback: hook java.net.URL.openConnection (HttpURLConnection) ----
+        // The X5 WebView may use HttpURLConnection for subresource loads.
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                "java.net.URL", classLoader, "openConnection",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val thisUrl = param.thisObject?.toString() ?: return
+                        if (!thisUrl.contains(CTWING_HOST)) return
+                        val conn = param.result ?: return
+                        hookConnectionResponse(conn, thisUrl)
+                    }
+                }
+            )
+            log("hooked java.net.URL.openConnection")
+        }.onFailure { log("URL.openConnection hook failed: ${it.message}") }
+    }
+
+    /** Wrap an HttpURLConnection to capture response body for JS/CSS bundles. */
+    private fun hookConnectionResponse(conn: Any, url: String) {
+        if (!url.contains(CTWING_HOST)) return
+        val isAsset = url.contains("/js/") || url.contains("/css/") ||
+            url.contains("/static/") || url.endsWith(".js") || url.endsWith(".css")
+        if (!isAsset) return
+        if (!savedUrls.add(url)) return
+        log("URL hook: $url")
+
+        // Hook getInputStream to read the response
+        runCatching {
+            val connClass = conn.javaClass
+            XposedHelpers.findAndHookMethod(connClass, "getInputStream",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val stream = param.result as? java.io.InputStream ?: return
+                        // Read fully on a background thread
+                        Thread {
+                            try {
+                                val bytes = stream.readBytes()
+                                saveBundle(url, bytes, "")
+                            } catch (e: Exception) {
+                                log("read failed $url: ${e.message}")
+                            }
+                        }.start()
+                    }
+                }
+            )
+        }.onFailure { /* best-effort */ }
+    }
+
+    private fun saveBundle(url: String, bytes: ByteArray, contentType: String) {
+        try {
+            val dir = File(Environment.getExternalStorageDirectory(), "dsh_ctwing_bundles")
+            dir.mkdirs()
+            val ext = when {
+                contentType.contains("javascript") || url.endsWith(".js") -> ".js"
+                contentType.contains("css") || url.endsWith(".css") -> ".css"
+                url.contains("/js/") -> ".js"
+                url.contains("/css/") -> ".css"
+                else -> ".dat"
+            }
+            val path = (java.net.URI(url).path ?: "/unknown")
+                .replace("/", "_").replace(".", "_").trim('_').take(80)
+            val file = File(dir, "${path}_${bytes.size}$ext")
+            file.writeBytes(bytes)
+            log("saved bundle: ${file.name} (${bytes.size}B)")
+        } catch (e: Exception) {
+            log("save failed: ${e.message}")
+        }
     }
 
     private fun handleCallResult(call: Any?, response: Any?) {
@@ -82,7 +136,6 @@ object CtwingNetworkHook {
             val method = XposedHelpers.callMethod(request, "method")?.toString() ?: "?"
             val headers = readHeaders(request)
 
-            // Capture credentials
             headers["Authorization"]?.let { lastAuthorization = it }
             headers["Cookie"]?.let { lastCookie = it }
             CtwingJsBridge.lastAuthHeader = lastAuthorization
@@ -93,6 +146,14 @@ object CtwingNetworkHook {
                 val peek = XposedHelpers.callMethod(response, "peekBody", Long.MAX_VALUE)
                 XposedHelpers.callMethod(peek, "string")?.toString()
             }.getOrNull()
+
+            // Save JS/CSS bundles
+            val isAsset = url.contains("/js/") || url.contains("/css/") ||
+                url.contains("/static/") || url.endsWith(".js") || url.endsWith(".css")
+            if (isAsset && body != null && body.isNotEmpty() && savedUrls.add(url)) {
+                log("capturing: ${url.take(120)}")
+                saveBundle(url, body.toByteArray(), "")
+            }
 
             for (l in listeners) runCatching {
                 l.onCtwingResponse(url, code, body)

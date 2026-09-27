@@ -1,126 +1,98 @@
-# Minimal Text Auto-Reply for WeChat
+# WeChat Auto-Reply Xposed Module (LSPosed)
 
-A distilled, self-contained Xposed module that implements **text-only auto-reply**
-for WeChat (`com.tencent.mm`), derived from the architecture of
-[WeKit](https://github.com/Ujhhgtg/WeKit)'s WeAgent subsystem (GPL-3.0).
-
-This is **not** a copy-paste of WeKit — it is a clean-room reimplementation of the
-same three-stage pipeline (capture → LLM → send) that is small enough to read in one
-sitting, with an explicit extension point for image handling later.
-
----
+Target: WeChat 8.0.76 (`com.tencent.mm`), Xiaomi 14 Pro, KernelSU root.
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│ MainHook (Xposed entry, package com.tencent.mm)              │
-│   └─ WeChatHook : IWeChatHook   — capture + send             │
-│        │  (hook WCDB insertWithOnConflict → message table)   │
-│        ▼                                                      │
-│   BufferedMessageTrigger — filter + debounce + batch         │
-│        │  (MessageTrigger: regex filter, cooldown, anti-loop)│
-│        ▼                                                      │
-│   AutoReplyEngine.onFlush                                     │
-│        │  ├─ mediaHandler?.handleImage()  → image path       │
-│        │  └─ llm.reply(content)            → reply text       │
-│        ▼                                                      │
-│   IWeChatHook.sendText(talker, reply)                        │
-│        │  (NetSceneSendMsg → NetSceneQueue → WeChat network) │
-│        ▼                                                      │
-│   WeChat sends the reply                                     │
-└───────────────────────────────────────────────────────────────┘
+Message INSERT (WCDB hook)
+  │  lvbuffer → msgSource → atuserlist
+  ▼
+BufferedMessageTrigger (1.5s debounce, dedup by talker+content)
+  │
+  ▼
+onFlush:
+  ├─ Whitelist gate  (/data/data/com.tencent.mm/files/autoreply_whitelist.json)
+  ├─ Group @-mention gate  (atuserlist → isAtMe)
+  ├─ CTWing keyword router (查询/诊断/重绑)
+  │    ├── query   → NativeHttp GET  → formatCardInfo
+  │    ├── diagnose → NativeHttp GET  → formatDiagnosis
+  │    └── rebind   → WebView XHR POST → parse result
+  └─ Fallback reply
 ```
+
+## CTWing Operations
+
+| Operation | Method | Transport |
+|-----------|--------|-----------|
+| query     | GET `/querySimBaseInfo` | NativeHttp (HttpURLConnection) |
+| diagnose  | GET `/intelligentDiagnosis` | NativeHttp (HttpURLConnection) |
+| rebind    | POST `/operationCommit` | WebView XHR (needs browser CSRF context) |
+
+Token acquired via `evaluateJavascript` reading `document.cookie` from the CTWing H5 WebView.
 
 ## File Map
 
 ```
-minimal_text_autoreply/
-├── settings.gradle.kts
-├── build.gradle.kts
-├── gradle.properties
-├── app/
-│   ├── build.gradle.kts
-│   └── src/main/
-│       ├── AndroidManifest.xml          — xposedmodule metadata
-│       ├── assets/xposed_init           — legacy entry declaration
-│       └── java/dev/example/autoreply/
-│           ├── hook/
-│           │   ├── IWeChatHook.kt       — capture+send abstraction
-│           │   ├── WeChatHook.kt        — DexKit+reflection impl (text only)
-│           │   └── MainHook.kt          — Xposed entry, config, wiring
-│           ├── trigger/
-│           │   ├── MessageTrigger.kt    — filter + cooldown config
-│           │   └── BufferedMessageTrigger.kt — debounce/batch buffer
-│           ├── llm/
-│           │   └── OpenAiClient.kt      — OpenAI chat completions
-│           ├── engine/
-│           │   └── AutoReplyEngine.kt   — wires it all together
-│           └── media/
-│               └── MediaHandler.kt      — image-reply extension point
+app/src/main/java/dev/example/autoreply/
+├── hook/
+│   ├── MainHook.kt              — Xposed entry, process routing, filter chain
+│   ├── WeChatHook.kt            — WCDB hook, sendText, selfWxId
+│   ├── IWeChatHook.kt           — IncomingMessage data class, interface
+│   ├── PopupMenuHook.kt         — "+" menu whitelist injection
+│   ├── WeDatabaseApi.kt         — rconversation rawQuery
+│   ├── AtParser.kt              — lvbuffer → msgSource → atuserlist
+│   └── WhitelistLauncher.kt     — ComposeView contact picker
+├── ctwing/
+│   ├── CtwingKeywordRouter.kt   — 查询/诊断/重绑 routing
+│   ├── CtwingFacade.kt          — pullToken, pollDshResult, mutex
+│   ├── NativeHttp.kt            — HTTP client (GET/POST, cachedToken/cachedCookie)
+│   ├── CtwingWebViewHook.kt     — WebView hijack + evaluateJs
+│   ├── CtwingJsInjector.kt      — window.__ctwing.* JS injection
+│   └── ...                      — Crypto, IPC, keep-alive, etc.
+└── ui/
+    ├── WhitelistScreen.kt       — Compose contact picker UI
+    └── WhitelistStore.kt        — JSON file storage
 ```
 
-## What Is Implemented
+## WeChat 8.0.76 Obfuscation Map
 
-| Layer | Status |
-|-------|--------|
-| Message capture (WCDB `insertWithOnConflict` hook) | ✅ code present |
-| Text filter (regex on content/talker, type==1) | ✅ code present |
-| Anti-loop (`filterOwnEvents` drops `isSend==1`) | ✅ code present |
-| Debounce/batch/max-wait buffering | ✅ code present |
-| Cooldown (rate-limit between replies) | ✅ code present |
-| LLM reply (OpenAI-compatible, configurable base URL) | ✅ code present |
-| Send reply via `NetSceneSendMsg` | ✅ code present (stub resolver) |
-| Image reply | ⬜ interface + stub only |
+| Role | Class |
+|------|-------|
+| PlusSubMenuHelper | `com.tencent.mm.ui.HomeUI` |
+| Inner helper | `com.tencent.mm.ui.rg` |
+| MenuItemData | `pg` (ctor: int,String,String,int,int) |
+| MenuItemWrapper | `og` (wraps pg) |
+| handleClick | `onItemClick` (in rg) |
+| MMKernel | `hm0.j1` |
+| getStorage | `u` |
+| NetSceneSendMsg | `y11.r0` |
+| NetSceneQueue | `com.tencent.mm.modelbase.r1` |
 
-## What You Still Must Do (Honest Gaps)
+## Build & Deploy
 
-This is **scaffolding with the full logic in place, not a ready-to-install APK.**
-Three things are deliberately left for you because they are WeChat-version-specific:
+```powershell
+$env:JAVA_HOME="C:\JDK\jdk-17.0.2"
+$env:ANDROID_HOME="C:\Android\Sdk"
+.\gradlew assembleDebug
 
-### 1. DexKit bridge wiring (WeChatHook.resolveSendPath)
-
-The `WeChatHook` documents the exact DexKit matchers (copied from WeKit's
-`WeMessageApi`) but does not inline the `DexKitBridge` construction. You must:
-
-1. Obtain the WeChat APK path (`lpparam.appInfo.sourceDir`).
-2. Build a `DexKitBridge` over it (see WeKit's `DexCacheManager.kt`).
-3. Run `findClass` / `findMethod` with the documented matchers to resolve:
-   - `classNetSceneSendMsg`, `classNetSceneQueue`, `classNetSceneBase`
-   - `methodPostToQueue`, `ctorNetSceneSendMsg` (5-arg and 6-arg)
-
-### 2. WeChat version
-
-The DexKit matchers target **8.0.65–8.0.78**. For any other version, decompile
-that APK and re-derive the matcher strings (class/method markers).
-
-### 3. Image reply
-
-`WeChatHook.sendImage` is a stub. When you need it, implement the DexKit targets
-documented in that method's comment (from WeKit's `WeMessageApi.sendImage`):
-`classImageServiceImpl`, `classImageTask`, the 5-param task constructor, and the
-`flow`-returning send method.
-
----
-
-## Build
-
-```bash
-# Requires JDK 17+, Android SDK (compileSdk 35)
-./gradlew assembleDebug
-# Install the APK, enable it in LSPosed/LSPatch for com.tencent.mm
+# Install via adb
+adb push app\build\outputs\apk\debug\app-debug.apk /data/local/tmp/autoreply.apk
+adb shell pm install -r /data/local/tmp/autoreply.apk
+adb shell am force-stop com.tencent.mm
+adb shell am start -n com.tencent.mm/.ui.LauncherUI
 ```
 
-## Configure
+## Known Pitfalls
 
-Edit `MainHook.kt`:
-- `apiKey` — your OpenAI (or compatible) key
-- `baseUrl` — endpoint (works with any OpenAI-compatible API: DeepSeek, Moonshot, etc.)
-- `model` — model name
-- `contentRegex` — set to e.g. `^@机器人` to only reply when @mentioned
+1. **lvbuffer** captured during INSERT; no DB fallback needed.
+2. **atuserlist** is CDATA-wrapped — strip `<![CDATA[` / `]]>`.
+3. **Group content format**: `wxid_xxx:@昵称 正文`; @ separator is U+2005.
+4. **selfWxId** must come from `com.tencent.mm_preferences` key `login_weixin_username`.
+5. **SparseArray** stores wrapper (og), not data (pg) — use single-arg ctor.
+6. **NativeHttp POST → 403**: CSRF on POST endpoints; must use WebView XHR.
+7. **pullToken double-escaping**: `callJs` returns JSON.stringify result — use JSONTokener.
 
-## Legal
+## License
 
-Derived from WeKit (GPL-3.0) — this project must remain GPL-3.0.
-WeChat's terms prohibit automated messaging; use responsibly and only
-where permitted.
+GPL-3.0 (derived from WeKit).

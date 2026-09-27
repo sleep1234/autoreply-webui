@@ -58,10 +58,44 @@ class CtwingJsBridge {
          */
         @Volatile
         var lastApiResponse: String? = null
+
+        /** The three AES passphrases captured by the CryptoJS hook.
+         *  These are device-constant (fingerprint-based), captured once
+         *  after login and reused for all API calls. */
+        @Volatile
+        var aesKey1: String? = null   // 层1: obfuscation key
+        @Volatile
+        var aesKey2: String? = null   // 层2: chain hash key
+        @Volatile
+        var aesKey3: String? = null   // 层3: payload encryption key
+        @Volatile
+        var bondId: String? = null    // ctl-dync-ct-bond header value
+
+        /** True once all three AES keys + bondId are captured. */
+        fun hasKeys(): Boolean = aesKey1 != null && aesKey2 != null && aesKey3 != null
     }
 
-    // ------------------------------------------------------------------
-    //  API result callback — resolves pendingRequests[rid]
+    // ==================================================================
+    //  Crypto key capture — called by injected JS hook
+    // ==================================================================
+
+    /** Called by the CryptoJS.AES.encrypt hook when it captures a key. */
+    @JavascriptInterface
+    fun onCryptoKey(layer: String, keyHex: String) {
+        when (layer) {
+            "1" -> { aesKey1 = keyHex; dlog("aesKey1=$keyHex") }
+            "2" -> { aesKey2 = keyHex; dlog("aesKey2=$keyHex") }
+            "3" -> { aesKey3 = keyHex; dlog("aesKey3=$keyHex") }
+        }
+    }
+
+    @JavascriptInterface
+    fun onBondId(id: String) {
+        bondId = id
+        dlog("bondId=$id")
+    }
+
+    // ==================================================================
     // ------------------------------------------------------------------
 
     @JavascriptInterface
@@ -76,6 +110,21 @@ class CtwingJsBridge {
         pendingRequests.remove(rid)?.completeExceptionally(
             RuntimeException("CTWing API error: $error")
         )
+    }
+
+    /**
+     * Called by injected JS to report auth token + bond cookie for native
+     * HTTP fallback. Persisted so NativeHttp can reuse it without WebView.
+     */
+    @JavascriptInterface
+    fun onAuthData(token: String, bond: String) {
+        if (token.isNotBlank()) {
+            lastAuthHeader = "Bearer $token"
+            NativeHttp.cachedToken = token
+        }
+        if (bond.isNotBlank()) NativeHttp.cachedBond = bond
+        lastCookie = "ACCESS_TOKEN=$token; ctl-dync-ct-bond=$bond"
+        dlog("onAuthData token_len=${token.length} bond_len=${bond.length}")
     }
 
     // ------------------------------------------------------------------
@@ -141,6 +190,45 @@ class CtwingJsBridge {
         dlog("onPageReady page=$pageName")
         isPageReady = true
         currentPage = pageName
+        // token 上报由 JS ready() 内部定时 pushAuth 完成
+    }
+
+    /**
+     * Receives the full page HTML (outerHTML), saves it to /sdcard/ for
+     * offline analysis. The HTML contains <script src="..."> tags pointing
+     * to the SPA JS bundles we need to reverse-engineer.
+     */
+    @JavascriptInterface
+    fun onDumpHtml(pageName: String, html: String) {
+        dlog("onDumpHtml page=$pageName html_len=${html.length}")
+        try {
+            val baseDir: java.io.File = CtwingIpcBridge.wechatDataDir?.let {
+                java.io.File(it, "dsh_ctwing_bundles")
+            } ?: java.io.File(android.os.Environment.getExternalStorageDirectory(), "dsh_ctwing_bundles")
+            baseDir.mkdirs()
+            val safeName = pageName.replace("/", "_").replace("\\", "_").replace(":", "_").take(60)
+            val file = java.io.File(baseDir, "page_${safeName}_${System.currentTimeMillis()}.html")
+            file.writeText(html)
+            dlog("html saved: ${file.absolutePath} (${html.length}B)")
+        } catch (e: Exception) {
+            dlog("html save failed: ${e.message}")
+        }
+    }
+
+    @JavascriptInterface
+    fun onScriptUrls(urlsJson: String) {
+        dlog("onScriptUrls len=${urlsJson.length}")
+        try {
+            val baseDir: java.io.File = CtwingIpcBridge.wechatDataDir?.let {
+                java.io.File(it, "dsh_ctwing_bundles")
+            } ?: java.io.File(android.os.Environment.getExternalStorageDirectory(), "dsh_ctwing_bundles")
+            baseDir.mkdirs()
+            val file = java.io.File(baseDir, "script_urls_${System.currentTimeMillis()}.json")
+            file.writeText(urlsJson)
+            dlog("script urls saved: ${file.absolutePath}")
+        } catch (e: Exception) {
+            dlog("script urls save failed: ${e.message}")
+        }
     }
 
     @JavascriptInterface

@@ -3,84 +3,84 @@ package dev.example.autoreply.ui
 import android.content.Context
 import android.content.SharedPreferences
 import de.robv.android.xposed.XSharedPreferences
+import de.robv.android.xposed.XposedBridge
+import java.io.File
 
 data class WhitelistEntry(val id: String, val name: String, val isGroup: Boolean)
 
 /**
- * 白名单 + 最近会话存储。
+ * 白名单存储。
  *
- * 跨进程共享方案：
- *   - 写入：UI 进程通过 Context.SharedPreferences（Editor.commit + sync 保证落地）
- *   - 读取：微信 hook 通过 LSPosed 的 XSharedPreferences（自动刷新）
+ * 白名单数据最终消费者是微信进程（onFlush 过滤）。UI 也跑在微信进程内
+ * （WhitelistLauncher），所以白名单直接存微信 dataDir 文件，同进程读写，
+ * 零跨进程、零 SELinux 问题。
+ *
+ *   - 主存储：/data/data/com.tencent.mm/files/autoreply_whitelist.json
+ *   - 兜底（独立 SettingsActivity 用）：模块 prefs 的 "whitelist" key
+ *
+ * 读取优先级：微信 dataDir 文件 → 模块 prefs。
+ * 写入：微信进程写 dataDir 文件；模块 UI 进程写 prefs（兼容旧入口）。
  */
 object WhitelistStore {
 
     private const val PREFS_NAME = "autoreply_prefs"
+    private const val WHITELIST_FILE = "/data/data/com.tencent.mm/files/autoreply_whitelist.json"
 
     @Volatile
     private var uiPrefs: SharedPreferences? = null
 
-    /** UI 侧（模块进程 dev.example.autoreply）必须调用此方法初始化写入能力 */
+    /** 模块 UI 进程初始化写入能力（独立 SettingsActivity 用） */
     fun initForUi(ctx: Context) {
         uiPrefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    private fun readPrefs(): SharedPreferences {
-        // UI 进程直接用缓存
+    /** 读取 prefs：模块 UI 进程用本地 prefs，微信进程用 XSharedPreferences */
+    private fun xprefs(): SharedPreferences {
         uiPrefs?.let { return it }
-        // 微信 hook 进程走 XSharedPreferences
         val sp = XSharedPreferences("dev.example.autoreply", PREFS_NAME)
         sp.makeWorldReadable()
         sp.reload()
         return sp
     }
 
-    // ---- 白名单 CRUD ----
+    // ---- 白名单读取 ----
     fun list(): List<WhitelistEntry> {
-        return decode(readPrefs().getString("whitelist", "[]") ?: "[]")
+        // 1. 微信 dataDir 文件（微信进程写的主存储）
+        val f = File(WHITELIST_FILE)
+        if (f.exists()) {
+            val raw = runCatching { f.readText() }.getOrNull()
+            if (!raw.isNullOrBlank()) return decode(raw)
+        }
+        // 2. 模块 prefs 兜底
+        return decode(xprefs().getString("whitelist", "[]") ?: "[]")
+    }
+
+    // ---- 白名单写入 ----
+    fun setList(entries: List<WhitelistEntry>) {
+        val json = encode(entries)
+        // 微信进程：写 dataDir 文件（主）
+        runCatching {
+            File(WHITELIST_FILE).writeText(json)
+        }
+        // 模块 UI 进程：写 prefs（兼容）
+        uiPrefs?.edit()?.putString("whitelist", json)?.commit()
     }
 
     fun add(id: String, name: String, isGroup: Boolean) {
         val entries = list().toMutableList()
         if (entries.none { it.id == id }) {
             entries.add(WhitelistEntry(id, name, isGroup))
-            write("whitelist", entries)
+            setList(entries)
         }
     }
 
-    fun remove(id: String) {
-        write("whitelist", list().filter { it.id != id })
-    }
+    fun remove(id: String) = setList(list().filter { it.id != id })
 
     fun isEmpty(): Boolean = list().isEmpty()
 
-    // ---- 最近会话 ----
-    fun addSeenTalker(id: String, displayName: String, isGroup: Boolean) {
-        val seen = seenTalkers().toMutableList()
-        if (seen.none { it.id == id }) {
-            seen.add(0, WhitelistEntry(id, displayName.ifBlank { id }, isGroup))
-            if (seen.size > 100) seen.removeAt(seen.lastIndex)
-            write("seen", seen)
-        }
-    }
+    fun contains(id: String): Boolean = list().any { it.id == id }
 
-    fun seenTalkers(): List<WhitelistEntry> {
-        return decode(readPrefs().getString("seen", "[]") ?: "[]")
-    }
-
-    // ---- 编码 & 写入 ----
-    private fun write(key: String, list: List<WhitelistEntry>) {
-        val json = encode(list)
-        // 只有 UI 进程有 true SharedPreferences（可写）；微信 hook 只能读
-        val sp = uiPrefs
-        if (sp != null) {
-            // 同步写入——apply() 异步可能被进程杀死导致丢失
-            sp.edit().putString(key, json).apply()
-            // 额外 commit 同步写入 _ts 确保 prefs 文件刷新
-            sp.edit().putString("_ts", System.currentTimeMillis().toString()).commit()
-        }
-    }
-
+    // ---- 编码 ----
     private fun encode(list: List<WhitelistEntry>): String {
         if (list.isEmpty()) return "[]"
         return "[" + list.joinToString(",") { e ->
@@ -95,9 +95,7 @@ object WhitelistStore {
             if (inner.isBlank()) return emptyList()
             inner.split("},{").map { block ->
                 val s = block.removePrefix("{").removeSuffix("}")
-                var id = ""
-                var name = ""
-                var isGroup = false
+                var id = ""; var name = ""; var isGroup = false
                 for (key in listOf("\"id\":\"", "id\":\"")) {
                     val idx = s.indexOf(key)
                     if (idx >= 0) {

@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Person
@@ -17,144 +16,170 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+/**
+ * 白名单选择器。
+ *
+ * 两种使用场景：
+ *   1. 微信进程内弹窗（WhitelistLauncher）：传入 initialConversations（rconversation 查询结果）
+ *      勾选后调用 WhitelistStore.setList 保存。
+ *   2. 独立 SettingsActivity：无参，用 WhitelistStore.list() 展示已保存白名单。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun WhitelistScreen() {
+fun WhitelistScreen(
+    initialConversations: List<WhitelistEntry>? = null,
+    onClose: (() -> Unit)? = null,
+) {
+    // 白名单（已保存）
     var entries by remember { mutableStateOf(WhitelistStore.list()) }
-    var seen by remember { mutableStateOf(WhitelistStore.seenTalkers()) }
-    var showDialog by remember { mutableStateOf(false) }
+    // 勾选状态（仅微信进程弹窗用，key = talker id）
+    var selected by remember {
+        mutableStateOf(WhitelistStore.list().map { it.id }.toSet())
+    }
+    // 搜索
+    var query by remember { mutableStateOf("") }
+
+    val conversations = initialConversations ?: entries
+    val filtered = remember(conversations, query) {
+        if (query.isBlank()) conversations
+        else conversations.filter {
+            it.name.contains(query, ignoreCase = true) || it.id.contains(query, ignoreCase = true)
+        }
+    }
 
     fun refresh() {
         entries = WhitelistStore.list()
-        seen = WhitelistStore.seenTalkers()
+        selected = entries.map { it.id }.toSet()
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("自动回复白名单") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                )
-            )
-        },
-        floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showDialog = true },
-                containerColor = MaterialTheme.colorScheme.primary,
+    Column(Modifier.fillMaxSize()) {
+        // 顶栏
+        Surface(color = MaterialTheme.colorScheme.primaryContainer) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(Icons.Default.Add, contentDescription = "添加")
-            }
-        }
-    ) { padding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            // ---- 最近会话（从微信消息中捕获的 talker） ----
-            if (seen.isNotEmpty()) {
-                item {
+                Column(Modifier.weight(1f)) {
                     Text(
-                        "最近会话（点选加入白名单）",
-                        fontSize = 14.sp,
+                        "自动回复白名单",
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 18.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
+                    Text(
+                        "勾选后仅这些会话会自动回复（${selected.size} 个）",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
                     )
                 }
-                items(seen, key = { "seen-${it.id}" }) { s ->
-                    val alreadyAdded = entries.any { it.id == s.id }
+                if (onClose != null) {
+                    TextButton(onClick = onClose) { Text("关闭") }
+                }
+            }
+        }
+
+        // 搜索框
+        if (initialConversations != null) {
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("搜索会话名或 wxid") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+
+        // 列表
+        if (filtered.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    if (initialConversations != null) "没有找到会话" else "白名单为空，将自动回复所有会话",
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().weight(1f),
+                contentPadding = PaddingValues(bottom = 80.dp),
+            ) {
+                items(filtered, key = { it.id }) { conv ->
+                    val checked = conv.id in selected
                     Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        tonalElevation = 1.dp,
-                        shape = MaterialTheme.shapes.medium,
                         onClick = {
-                            if (!alreadyAdded) {
-                                WhitelistStore.add(s.id, s.name, s.isGroup)
-                                refresh()
-                            }
+                            selected = if (checked) selected - conv.id else selected + conv.id
                         },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = if (checked) MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surface,
                     ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Icon(
-                                imageVector = if (s.isGroup) Icons.Default.Group else Icons.Default.Person,
+                                imageVector = if (conv.isGroup) Icons.Default.Group else Icons.Default.Person,
                                 contentDescription = null,
-                                tint = if (s.isGroup) MaterialTheme.colorScheme.tertiary
+                                tint = if (conv.isGroup) MaterialTheme.colorScheme.tertiary
                                        else MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(32.dp)
                             )
                             Spacer(Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
+                            Column(Modifier.weight(1f)) {
+                                Text(conv.name, fontWeight = FontWeight.Medium, fontSize = 15.sp)
                                 Text(
-                                    if (s.isGroup) "群聊" else "私聊",
+                                    (if (conv.isGroup) "群聊 · " else "私聊 · ") + conv.id,
                                     fontSize = 12.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
-                                Text(
-                                    s.id,
-                                    fontWeight = FontWeight.Medium,
-                                    fontSize = 14.sp,
-                                )
                             }
-                            if (alreadyAdded) {
-                                Icon(
-                                    Icons.Default.Check,
-                                    contentDescription = "已加入",
-                                    tint = MaterialTheme.colorScheme.primary,
-                                )
-                            } else {
-                                Text("添加", color = MaterialTheme.colorScheme.primary, fontSize = 14.sp)
-                            }
+                            Checkbox(checked = checked, onCheckedChange = null)
                         }
                     }
                 }
-                item { HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant) }
             }
+        }
 
-            // ---- 白名单 ----
-            item {
-                Text(
-                    "白名单（${entries.size}）",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (entries.isEmpty()) {
-                item {
-                    Text(
-                        "白名单为空，将自动回复所有会话。\n添加后仅名单内的会话会自动回复。",
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.outline,
-                    )
-                }
-            } else {
-                items(entries, key = { it.id }) { entry ->
-                    WhitelistRow(
-                        entry = entry,
-                        onDelete = {
-                            WhitelistStore.remove(entry.id)
+        // 底部保存栏（仅微信进程弹窗用）
+        if (initialConversations != null) {
+            Surface(color = MaterialTheme.colorScheme.surface) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            // 全选
+                            selected = filtered.map { it.id }.toSet()
+                        },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("全选") }
+                    OutlinedButton(
+                        onClick = { selected = emptySet() },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("清空") }
+                    Button(
+                        onClick = {
+                            val saved = conversations.filter { it.id in selected }
+                            WhitelistStore.setList(saved)
                             refresh()
-                        }
+                            onClose?.invoke()
+                        },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("保存") }
+                }
+            }
+        } else {
+            // 独立 SettingsActivity：展示已保存白名单，可删除
+            if (entries.isNotEmpty()) {
+                Surface(color = MaterialTheme.colorScheme.surface) {
+                    Text(
+                        "提示：此页面为独立设置入口。\n完整勾选选择器请在微信内打开。",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.padding(16.dp),
                     )
                 }
             }
         }
-    }
-
-    if (showDialog) {
-        AddWhitelistDialog(
-            onDismiss = { showDialog = false },
-            onAdd = { id, name, isGroup ->
-                WhitelistStore.add(id, name, isGroup)
-                refresh()
-                showDialog = false
-            }
-        )
     }
 }
 
@@ -174,13 +199,12 @@ fun WhitelistRow(entry: WhitelistEntry, onDelete: () -> Unit) {
                 contentDescription = null,
                 tint = if (entry.isGroup) MaterialTheme.colorScheme.tertiary
                        else MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(36.dp)
             )
             Spacer(Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
+            Column(Modifier.weight(1f)) {
                 Text(entry.name, fontWeight = FontWeight.Medium, fontSize = 16.sp)
                 Text(
-                    if (entry.isGroup) "群聊 · ${entry.id}" else "私聊 · ${entry.id}",
+                    (if (entry.isGroup) "群聊 · " else "私聊 · ") + entry.id,
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -190,60 +214,4 @@ fun WhitelistRow(entry: WhitelistEntry, onDelete: () -> Unit) {
             }
         }
     }
-}
-
-@Composable
-fun AddWhitelistDialog(
-    onDismiss: () -> Unit,
-    onAdd: (id: String, name: String, isGroup: Boolean) -> Unit,
-) {
-    var id by remember { mutableStateOf("") }
-    var name by remember { mutableStateOf("") }
-    var isGroup by remember { mutableStateOf(false) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("添加到白名单") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(
-                    value = id,
-                    onValueChange = { id = it },
-                    label = { Text("会话ID (wxid 或 @chatroom)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("备注名称") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("会话类型：", modifier = Modifier.padding(end = 8.dp))
-                    FilterChip(
-                        selected = !isGroup,
-                        onClick = { isGroup = false },
-                        label = { Text("私聊") },
-                        leadingIcon = { Icon(Icons.Default.Person, null, Modifier.size(18.dp)) },
-                        modifier = Modifier.padding(end = 8.dp),
-                    )
-                    FilterChip(
-                        selected = isGroup,
-                        onClick = { isGroup = true },
-                        label = { Text("群聊") },
-                        leadingIcon = { Icon(Icons.Default.Group, null, Modifier.size(18.dp)) },
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onAdd(id.trim(), name.trim().ifBlank { id.trim() }, isGroup) },
-                enabled = id.isNotBlank(),
-            ) { Text("添加") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-    )
 }

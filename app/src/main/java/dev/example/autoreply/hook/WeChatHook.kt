@@ -39,12 +39,18 @@ class WeChatHook(
     private var getTalkerMethod: Method? = null
     private var getTalkerReceiver: Any? = null
 
+    /** 自己的 wxid。参考 WeKit：读微信 prefs 的 login_weixin_username。 */
     override val selfWxId: String?
         get() = runCatching {
-            XposedHelpers.callStaticMethod(
-                Class.forName("com.tencent.mm.kernel.CoreAccount", false, classLoader),
-                "getCurrentUserName"
-            ) as? String
+            // 微信 prefs（WeKit 的方式，最可靠）
+            val at = Class.forName("android.app.ActivityThread", false, classLoader)
+            val app = at.getMethod("currentApplication").invoke(null)
+            val prefs = app.javaClass.getMethod("getSharedPreferences", String::class.java, Int::class.java)
+                .invoke(app, "com.tencent.mm_preferences", 0)
+            val wxid = prefs.javaClass.getMethod("getString", String::class.java, String::class.java)
+                .invoke(prefs, "login_weixin_username", null) as? String
+            if (!wxid.isNullOrBlank()) return wxid
+            null
         }.getOrNull()
 
     // ===================================================================
@@ -288,6 +294,7 @@ class WeChatHook(
             content = values.getAsString("content"),
             isSend = (values.getAsInteger("isSend") ?: 0) == 1,
             createTime = values.getAsLong("createTime"),
+            lvBuffer = values.getAsByteArray("lvbuffer"),
         )
         log("message INSERT: type=${msg.type} isSend=${msg.isSend} talker=${msg.talker} content=${msg.content}")
         for (l in insertListeners) runCatching { l.onMessageInsert(msg) }

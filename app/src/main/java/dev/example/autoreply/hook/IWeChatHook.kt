@@ -74,6 +74,7 @@ data class IncomingMessage(
     val content: String?,
     val isSend: Boolean,
     val createTime: Long?,
+    val lvBuffer: ByteArray? = null,
 )
 
 fun interface MessageInsertListener {

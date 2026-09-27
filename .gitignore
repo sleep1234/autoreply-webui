@@ -19,3 +19,22 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Secrets / captured runtime data
+credentials.json
+bundles/
+*.js
+*.html
+*.png
+ct_sbu_1.js
+ct_sbu_2.js
+spa_dump.html
+spa_home.html
+spa_index.html
+ctwing_index.html
+analyse_ctrobf1.js
+decode_cd.js
+gen_ts.js
+gen_ts_input.js
+locate_bad_bytes.js
+run_sbu1_trace.js
