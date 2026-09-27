@@ -173,6 +173,8 @@ object CtwingKeywordRouter {
                     else send("⚠️ 查询未完成：${(raw ?: "null").take(120)}")
                 }
                 "diagnose" -> {
+                    kotlinx.coroutines.delay(2_000L)
+                    CtwingFacade.pullToken()
                     val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
                     val raw = runCatching {
@@ -182,6 +184,12 @@ object CtwingKeywordRouter {
                         null
                     }
                     CtwingFacade.releaseWakeLock()
+                    // 先检测业务错误（code!=0）——如 401 未登录
+                    val errorMsg = raw?.let { extractQueryError(it) }
+                    if (errorMsg != null) {
+                        send("⚠️ 诊断失败：$errorMsg")
+                        return@withLock
+                    }
                     val bestResp = raw?.let { extractBestResponse(it) }
                     if (bestResp != null) send(formatDiagnosis(bestResp))
                     else send("⚠️ 诊断超时：${(raw ?: "null").take(120)}")

@@ -1,17 +1,24 @@
 # 天翼物联一站式服务工具 — 开发复盘与经验总结
 
-> 2026-09-27 | 本次会话全程复盘
+> 2026-09-27 | 全会话复盘（两轮对话合并）
 
 ---
 
-## 一、本次会话解决的问题
+## 一、解决的问题总览
 
-1. **诊断/重绑一直返回空或超时** → 根因是同步 XHR 在 X5 内核被禁用（status:0），改为 NativeHttp GET + WebView XHR POST 分流
-2. **并发查询/重绑数据串扰** → `CtwingJsBridge.lastApiResponse` 全局单例 → `webViewMutex` 串行化
-3. **H5 抢前台影响微信使用** → 方案A：NEW_DOCUMENT+MULTIPLE_TASK 独立任务栈 + moveTaskToBack
-4. **尝试自建 WebView 绕开微信** → 方向B验证失败，pinus.sdk.WebView 冷启动 NPE，结论写入 SELF_CREATE_WEBVIEW_RESEARCH.md
-5. **非台州卡查询返回 raw JSON** → extractQueryError 友好提示
-6. **非命令消息回复太随意** → 统一欢迎帮助信息
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | 诊断/重绑返回空或超时 | 同步 XHR 在 X5 内核被禁用（status:0） | NativeHttp GET + WebView XHR POST 分流 |
+| 2 | 并发查询/重绑数据串扰 | CtwingJsBridge.lastApiResponse 全局单例 | webViewMutex 串行化 |
+| 3 | H5 抢前台影响微信使用 | MMWebViewUI 默认进入前台任务栈 | 方案A：NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack |
+| 4 | 自建 WebView 绕开微信 | pinus.sdk.WebView 冷启动 NPE | 验证不可行，写入 SELF_CREATE_WEBVIEW_RESEARCH.md |
+| 5 | 非台州卡查询返回 raw JSON | 无业务错误码友好提示 | extractQueryError 友好提示 |
+| 6 | 非命令消息回复太随意 | 旧的在吗/帮助/兜底回复 | 统一欢迎帮助信息 |
+| 7 | **诊断 401 账号未登录** | 诊断分支漏 pullToken，直接用过期 token | 补 pullToken（与查询一致） |
+| 8 | **白名单双开无法保存** | createPackageContext 跨包无写权限 | 改用微信 lpparam.appInfo.dataDir |
+| 9 | **白名单空列表语义** | 旧逻辑空列表=回复所有人 | 改为空列表=不回复任何人 |
+| 10 | **白名单保存按钮残留** | 清空只清内存，保存时预勾选复写 | 清空立即写文件 + 打开默认全不勾选 |
+| 11 | 模块更名/去图标/静态scope | 产品化需求 | 天翼物联一站式服务工具 |
 
 ---
 
@@ -54,7 +61,6 @@ JEP：**不要试图自建 X5 WebView。老老实实让微信创建，然后偷�
 
 `callJs` 返回 JS `JSON.stringify({token, cookie})` 的结果。
 evaluateJavascript 的 ValueCallback 再把这个字符串 JSON-encode 一层传回来。
-所以拿到的是 `"\"{\\"token\\":\\"...}\""` 这种双重转义格式。
 修复：先用 `JSONObject(raw)` 解析，失败则 `JSONTokener(raw).nextValue()` 剥一层再解。
 JEP：**所有 evaluateJavascript 的返回结果都可能双重转义，用 JSONTokener 做容错解析。**
 
@@ -62,11 +68,29 @@ JEP：**所有 evaluateJavascript 的返回结果都可能双重转义，用 JSO
 
 finish MMWebViewUI 会暂停 WebView 渲染器 → pullToken 超时（evaluateJavascript 无响应）。
 moveTaskToBack 保持 Activity 存活、WebView 正常渲染。
-JEP：**偷取后必须用 moveTaskToBack，不能 finish。WebView 的生命周期依赖宿主 Activity。**
+JEP：**偷取后必须用 moveTaskToBack，不能 finish。**
+
+### 2.7 每次 NativeHttp 请求前必须 pullToken
+
+查询每次先 pullToken 再请求，正常工作。诊断漏了 pullToken，直接用 `NativeHttp.cachedToken`（可能是几十分钟前的旧值）→ 401"账号未登录"。
+JEP：**所有需要登录态的 NativeHttp GET 请求，必须先 `pullToken(cookie)` 刷新 token。不要假设 cachedToken 有效。**
+
+### 2.8 白名单存储路径跨包权限
+
+用 `createPackageContext("dev.example.autoreply")` 拿模块 filesDir → 代码跑在微信进程（UID 不同）→ 无写权限 → 保存静默失败（runCatching 吞异常）。
+正确做法：用微信 `lpparam.appInfo.dataDir` 下的子目录（如 `files/autoreply/`），每个微信实例各自独立。
+JEP：**Xposed 模块写文件只能用宿主进程有写权限的路径，不能跨包写。**
+
+### 2.9 白名单语义
+
+- 空列表 = **不回复任何人**（所有消息被 skip）
+- 非空列表 = 只回复列表内的会话
+- 打开选择器默认全不勾选（防止旧数据误保存）
+- "清空"按钮必须立即 `setList(emptyList())` 写文件，不能只清 Compose 内存状态
 
 ---
 
-## 三、方案 A 静默后台的核心原理
+## 三、方案 A 静默后台核心原理
 
 ```
 rebuildH5:
@@ -88,25 +112,34 @@ rebuildAndWait:
 
 ## 四、调试工作流经验
 
-1. **不要反复 force-stop 微信**：多次 force-stop 可能触发微信安全模式或双用户进程异常。出现问题先检查设备状态而不是盲目重启。
+1. **不要反复 force-stop 微信**：多次 force-stop 可能触发微信安全模式。出现问题先检查设备状态。
 2. **先读日志再动手**：每次部署后等 20s → 读完整链路日志 → 确认状态再让人测试。
-3. **不要猜，要验证**：自建 WebView 的方案做了 4 次尝试才确认不可行，但每次都有具体的错误信息推进方向。
-4. **Git 代理问题**：本机 git 配了 `http.proxy=127.0.0.1:7890`，push GitHub 时 TLS 不通。绕过方式：`git -c http.proxy= -c https.proxy= push`。
-5. **adb pm install 只能装设备路径**：不能 `pm install <PC路径>`，必须 `adb push` → `/data/local/tmp/` → `pm install`。
+3. **不要猜，要验证**：自建 WebView 做了 4 次尝试才确认不可行，但每次都有具体的错误信息推进方向。
+4. **Git 代理问题**：本机 git 配了 `http.proxy=127.0.0.1:7890`，push GitHub 时 TLS 不通。绕过：`git -c http.proxy= -c https.proxy= push`。
+5. **adb pm install 只能装设备路径**：必须 `adb push` → `/data/local/tmp/` → `pm install`。
 6. **APK 卸载后再装**：改了 manifest（去掉 LAUNCHER）后旧 shortcut 残留，必须 `pm uninstall` 清干净。
+7. **分析问题时逐层隔离**：白名单"不生效"其实是 UI 保存按钮逻辑问题，不是过滤逻辑。先删文件验证过滤逻辑本身正确，再排查 UI 写文件。
 
 ---
 
-## 五、后续迭代的安全区
+## 五、修改文件清单（本次会话）
 
-以下区域可以安全修改，不影响核心链路：
-- `CtwingKeywordRouter.kt`：格式化输出（formatCardInfo/formatDiagnosis）、extractQueryError 错误文案
-- `MainHook.kt`：欢迎回复文案、白名单逻辑
-- `AndroidManifest.xml`：模块名、描述
-- 可以加新的关键词命令（如"刷新token"），只需在 CtwingKeywordRouter 里加一条路由
+| 文件 | 改动 |
+|------|------|
+| `MainHook.kt` | 白名单逻辑反转（空=不回复）+ WhitelistStore.initWithDataDir |
+| `WhitelistStore.kt` | 存储路径改微信 dataDir + 双开兼容 + 诊断日志 |
+| `WhitelistScreen.kt` | 打开默认全不勾选 + 清空立即保存 + 保存按钮日志 |
+| `CtwingKeywordRouter.kt` | 诊断补 pullToken + 业务错误检测 |
+| `AndroidManifest.xml` | 模块更名/去桌面图标/静态scope |
+| `arrays.xml`（新增） | 静态作用域声明 |
+| `ARCHITECTURE.md` | 方案A描述 + 模块元信息 |
+| `开发总结.md` | 踩坑清单扩展（新增 5 条） |
+| `MEMORY.md` | 复盘总结（合并两轮对话） |
 
-以下区域修改需谨慎，建议先打备份：
-- `CtwingFacade.kt`：pullToken、rebuildH5、操作互斥锁
-- `CtwingWebViewHook.kt`：WebView 定位、加载拦截、keep-alive
-- `WebViewPool.kt`：overlay 创建、WebView 偷取
-- `NativeHttp.kt`：HTTP 请求/缓存逻辑
+---
+
+## 六、安全修改区域
+
+**可以安全修改**：`CtwingKeywordRouter.kt` 格式化/文案、`MainHook.kt` 欢迎回复、`AndroidManifest.xml` 元信息
+
+**需要谨慎**：`CtwingFacade.kt` pullToken/rebuildH5、`CtwingWebViewHook.kt` WebView 定位、`WebViewPool.kt` overlay 创建、`NativeHttp.kt` HTTP 请求

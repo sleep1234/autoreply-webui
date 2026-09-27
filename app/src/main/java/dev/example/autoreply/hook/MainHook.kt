@@ -88,6 +88,10 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
         loadNativeLibrary(lpparam)
         CtwingIpcBridge.wechatDataDir = lpparam.appInfo.dataDir
 
+        // 初始化白名单存储目录（用微信 dataDir，每个实例独立，双开安全）
+        WhitelistStore.initWithDataDir(lpparam.appInfo.dataDir)
+        XposedBridge.log("[AutoReply] WhitelistStore.init dataDir=${lpparam.appInfo.dataDir}")
+
         // ---- WeChat message capture + send ----
         val hook = WeChatHook(lpparam.classLoader)
 
@@ -121,8 +125,9 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 XposedBridge.log("[AutoReply] onFlush: talker=$talker text=$text")
 
                 val whitelist = WhitelistStore.list()
-                if (whitelist.isNotEmpty() && whitelist.none { target.talker == it.id }) {
-                    XposedBridge.log("[AutoReply] skipped: talker=$talker not in whitelist")
+                // 白名单为空 = 不回复任何人；非空 = 只回复白名单内的会话
+                if (whitelist.isEmpty() || whitelist.none { target.talker == it.id }) {
+                    XposedBridge.log("[AutoReply] skipped: talker=$talker not in whitelist (whitelistSize=${whitelist.size})")
                     continue
                 }
 

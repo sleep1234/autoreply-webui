@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import de.robv.android.xposed.XposedBridge
 
 /**
  * 白名单选择器。
@@ -32,10 +33,8 @@ fun WhitelistScreen(
 ) {
     // 白名单（已保存）
     var entries by remember { mutableStateOf(WhitelistStore.list()) }
-    // 勾选状态（仅微信进程弹窗用，key = talker id）
-    var selected by remember {
-        mutableStateOf(WhitelistStore.list().map { it.id }.toSet())
-    }
+    // 勾选状态：打开时默认全不勾选，让用户明确手动选择
+    var selected by remember { mutableStateOf(emptySet<String>()) }
     // 搜索
     var query by remember { mutableStateOf("") }
 
@@ -153,12 +152,18 @@ fun WhitelistScreen(
                         modifier = Modifier.weight(1f),
                     ) { Text("全选") }
                     OutlinedButton(
-                        onClick = { selected = emptySet() },
+                        onClick = {
+                            // 清空并立即保存
+                            selected = emptySet()
+                            WhitelistStore.setList(emptyList())
+                            refresh()
+                        },
                         modifier = Modifier.weight(1f),
                     ) { Text("清空") }
                     Button(
                         onClick = {
                             val saved = conversations.filter { it.id in selected }
+                            XposedBridge.log("[Whitelist] 保存按钮: selected=${selected} saved=${saved.map { it.id }}")
                             WhitelistStore.setList(saved)
                             refresh()
                             onClose?.invoke()

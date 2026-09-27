@@ -2,7 +2,6 @@ package dev.example.autoreply.ui
 
 import android.content.Context
 import android.content.SharedPreferences
-import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.XposedBridge
 import java.io.File
 
@@ -12,19 +11,37 @@ data class WhitelistEntry(val id: String, val name: String, val isGroup: Boolean
  * 白名单存储。
  *
  * 白名单数据最终消费者是微信进程（onFlush 过滤）。UI 也跑在微信进程内
- * （WhitelistLauncher），所以白名单直接存微信 dataDir 文件，同进程读写，
- * 零跨进程、零 SELinux 问题。
+ * （WhitelistLauncher），所以白名单直接存模块自己的 dataDir 文件，同进程读写。
  *
- *   - 主存储：/data/data/com.tencent.mm/files/autoreply_whitelist.json
- *   - 兜底（独立 SettingsActivity 用）：模块 prefs 的 "whitelist" key
+ *   - 主存储：{模块dataDir}/files/autoreply_whitelist.json
+ *     (如 /data/data/dev.example.autoreply/files/autoreply_whitelist.json)
+ *   - 不在微信 dataDir 下存储——双开/多用户环境下路径不同，
+ *     且 SELinux 可能拦截跨包写入。
  *
- * 读取优先级：微信 dataDir 文件 → 模块 prefs。
- * 写入：微信进程写 dataDir 文件；模块 UI 进程写 prefs（兼容旧入口）。
+ * 通过 createPackageContext 动态获取模块目录，适配双开/多用户场景。
  */
 object WhitelistStore {
 
     private const val PREFS_NAME = "autoreply_prefs"
-    private const val WHITELIST_FILE = "/data/data/com.tencent.mm/files/autoreply_whitelist.json"
+
+    @Volatile
+    private var filesDir: File? = null
+
+    /** 在微信进程启动时调用一次，传入微信 dataDir（lpparam.appInfo.dataDir）。
+     *  每个微信实例（主微信/双开）有独立 dataDir，双开安全。 */
+    fun initWithDataDir(dataDir: String) {
+        val dir = File(dataDir, "files/autoreply")
+        dir.mkdirs()
+        filesDir = dir
+    }
+
+    /** 在微信进程启动时调用一次，传入微信 Context 以获取 filesDir。 */
+    fun init(ctx: Context) {
+        if (filesDir != null) return
+        val dir = File(ctx.filesDir, "autoreply")
+        dir.mkdirs()
+        filesDir = dir
+    }
 
     @Volatile
     private var uiPrefs: SharedPreferences? = null
@@ -34,36 +51,39 @@ object WhitelistStore {
         uiPrefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    /** 读取 prefs：模块 UI 进程用本地 prefs，微信进程用 XSharedPreferences */
-    private fun xprefs(): SharedPreferences {
-        uiPrefs?.let { return it }
-        val sp = XSharedPreferences("dev.example.autoreply", PREFS_NAME)
-        sp.makeWorldReadable()
-        sp.reload()
-        return sp
+    /** 获取模块存储目录下的文件，每次调用确保目录存在。 */
+    private fun moduleFile(filename: String): File {
+        val dir = filesDir
+        if (dir == null) {
+            // 兜底：直接写微信 filesDir（兼容 init 未调用场景）
+            val fallback = File("/data/data/com.tencent.mm/files/autoreply")
+            fallback.mkdirs()
+            return File(fallback, filename)
+        }
+        dir.mkdirs()
+        return File(dir, filename)
     }
 
     // ---- 白名单读取 ----
     fun list(): List<WhitelistEntry> {
-        // 1. 微信 dataDir 文件（微信进程写的主存储）
-        val f = File(WHITELIST_FILE)
+        // 1. 模块 dataDir 文件（主存储）
+        val f = moduleFile("autoreply_whitelist.json")
+        XposedBridge.log("[Whitelist] list() path=${f.absolutePath} exists=${f.exists()}")
         if (f.exists()) {
             val raw = runCatching { f.readText() }.getOrNull()
+            XposedBridge.log("[Whitelist] list() raw=$raw")
             if (!raw.isNullOrBlank()) return decode(raw)
         }
-        // 2. 模块 prefs 兜底
-        return decode(xprefs().getString("whitelist", "[]") ?: "[]")
+        // 2. 空数组兜底
+        return emptyList()
     }
 
     // ---- 白名单写入 ----
     fun setList(entries: List<WhitelistEntry>) {
         val json = encode(entries)
-        // 微信进程：写 dataDir 文件（主）
-        runCatching {
-            File(WHITELIST_FILE).writeText(json)
-        }
-        // 模块 UI 进程：写 prefs（兼容）
-        uiPrefs?.edit()?.putString("whitelist", json)?.commit()
+        val f = moduleFile("autoreply_whitelist.json")
+        val ok = runCatching { f.writeText(json) }.isSuccess
+        XposedBridge.log("[Whitelist] setList() path=${f.absolutePath} ok=$ok json=$json")
     }
 
     fun add(id: String, name: String, isGroup: Boolean) {
