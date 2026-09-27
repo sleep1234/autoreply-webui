@@ -20,6 +20,9 @@
 | 10 | **白名单保存按钮残留** | 清空只清内存，保存时预勾选复写 | 清空立即写文件 |
 | 11 | 模块更名/去图标/静态scope | 产品化需求 | 天翼物联一站式服务工具 |
 | 12 | **白名单保存后重开不显示勾选** | 排查旧数据时把 selected 改成永远空集合，破坏回显 | selected 恢复从 list() 初始化 |
+| 13 | **群聊回复 @ 发起者 + 真实 @ 通知** | 普通 sendText 无 @；纯文本 @ 无服务器提醒 | AtMentionHook 入库前注入 atuserlist + wrapReply 加 @昵称 |
+| 14 | **重绑结果回显卡号** | 结果只显示工单号，群聊难对应 | 结果末尾追加 ICCID/接入号/IMSI 标签 + 号码 |
+| 15 | **手动 @（普通空格）不被识别** | 微信 @ 靠 atuserlist，手动打 @ 无此数据 | 兜底检测 content 含 @自身昵称 |
 
 ---
 
@@ -90,6 +93,24 @@ JEP：**Xposed 模块写文件只能用宿主进程有写权限的路径，不�
 - "清空"按钮必须立即 `setList(emptyList())` 写文件，不能只清 Compose 内存状态
 - **无敌模式（紧急关闭）**：用 su 删掉 `autoreply_whitelist.json` 文件 → 空白名单不回复任何人
 
+### 2.10 群聊真实 @ 通知（参照 WeKit MentionMembers）
+
+微信的 @ 提醒靠消息 msgSource 里的 `<atuserlist>` 节点，不是 content 文本里的 "@昵称"。
+
+实现链路：
+1. 回复前 `AtMentionHook.pend(talker, senderWxId)` 注册目标
+2. Hook `MsgInfoStorage.insert`（锚点日志 `"protect:c2c msg should not here"`）
+3. before 拦截 → 读 msgInfo 的 `field_talker`/`field_isSend`/`field_type` 校验
+4. 调用 MsgSourceHelper 合并方法（锚点正则 `(?s)<alnode[^>]*>.*?</alnode>`，static 3 args void）
+5. 注入 `<atuserlist><![CDATA[wxid]]></atuserlist>` → 微信服务器推送 "@我" 提醒
+
+字段名：`field_talker` / `field_isSend` / `field_type` / `field_msgSvrId`（微信 MsgInfo 内部命名，WeKit 同款）。
+
+关键坑：
+- 手动输入的 "@昵称"（普通空格）不会写入 atuserlist，AtParser.isAtMeOrAll 检测不到 → 需要 content 兜底匹配 @自身昵称
+- msgInfo 字段可能在父类，需要递归 getDeclaredField
+- talker 不匹配时不能直接丢弃 pending（可能是其他会话先触发了入库），要 restore 重试
+
 ---
 
 ## 三、方案 A 静默后台核心原理
@@ -137,6 +158,8 @@ rebuildAndWait:
 | `ARCHITECTURE.md` | 方案A描述 + 模块元信息 |
 | `开发总结.md` | 踩坑清单扩展（新增 5 条） |
 | `MEMORY.md` | 复盘总结（合并两轮对话） |
+| `AtMentionHook.kt`（新增） | 真实 @ 通知：DexKit 解析 + 消息入库 hook + atuserlist 注入 |
+| `WeDatabaseApi.kt` | 新增 getNickname(wxid) 查 rcontact |
 
 ---
 
@@ -144,4 +167,4 @@ rebuildAndWait:
 
 **可以安全修改**：`CtwingKeywordRouter.kt` 格式化/文案、`MainHook.kt` 欢迎回复、`AndroidManifest.xml` 元信息
 
-**需要谨慎**：`CtwingFacade.kt` pullToken/rebuildH5、`CtwingWebViewHook.kt` WebView 定位、`WebViewPool.kt` overlay 创建、`NativeHttp.kt` HTTP 请求
+**需要谨慎**：`CtwingFacade.kt` pullToken/rebuildH5、`CtwingWebViewHook.kt` WebView 定位、`WebViewPool.kt` overlay 创建、`NativeHttp.kt` HTTP 请求、`AtMentionHook.kt` DexKit 解析与 atuserlist 注入

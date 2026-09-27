@@ -183,6 +183,38 @@ object WeDatabaseApi {
         }.getOrDefault(emptyList())
     }
 
+    /** 根据 wxid 查 rcontact 表获取显示名（备注 > 昵称 > 别名）。 */
+    fun getNickname(wxid: String): String? {
+        val db_ = db ?: return null
+        return runCatching {
+            val rawQuery = db_.javaClass.methods.firstOrNull { m ->
+                m.name == "rawQuery" && m.parameterCount >= 2 && m.parameterTypes[0] == String::class.java
+            } ?: db_.javaClass.declaredMethods.firstOrNull { m ->
+                m.name == "rawQuery" && m.parameterCount >= 2 && m.parameterTypes[0] == String::class.java
+            } ?: return null
+            rawQuery.isAccessible = true
+            // wxid 是字母数字下划线，安全拼接无注入风险
+            val sql = "SELECT nickname, conRemark, alias FROM rcontact WHERE username = '$wxid'"
+            val cursor = when (rawQuery.parameterCount) {
+                2 -> rawQuery.invoke(db_, sql, null)
+                3 -> rawQuery.invoke(db_, sql, null, null)
+                4 -> rawQuery.invoke(db_, sql, null, null, null)
+                else -> rawQuery.invoke(db_, sql)
+            } as? android.database.Cursor ?: return null
+
+            cursor.use { cur ->
+                if (!cur.moveToFirst()) return null
+                val nickname = cur.getString(cur.getColumnIndexOrThrow("nickname")) ?: ""
+                val conRemark = cur.getString(cur.getColumnIndexOrThrow("conRemark")) ?: ""
+                val alias = cur.getString(cur.getColumnIndexOrThrow("alias")) ?: ""
+                val name = conRemark.ifBlank { nickname.ifBlank { alias } }
+                if (name.isBlank()) null else name
+            }
+        }.onFailure {
+            XposedBridge.log("$TAG getNickname failed: ${it.message}")
+        }.getOrNull()
+    }
+
     /** 根据 msgSvrId 查 message 表的 lvbuffer 并解析是否 @ 了自己。 */
     fun isAtMe(msgSvrId: Long?, selfWxId: String?): Boolean {
         if (msgSvrId == null || selfWxId == null) return false

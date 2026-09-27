@@ -198,6 +198,12 @@ object CtwingKeywordRouter {
                     send("🔄 正在提交重绑…")
                     CtwingFacade.pullToken()
                     val idType = inferType(iccid)
+                    // 卡号类型中文标签：根据用户发来的号码类型回显
+                    val idTypeLabel = when (idType) {
+                        "msisdn" -> "接入号"
+                        "imsi" -> "IMSI"
+                        else -> "ICCID"
+                    }
                     val payload = org.json.JSONObject().apply {
                         put("type", idType)
                         put("id", iccid)
@@ -290,7 +296,7 @@ object CtwingKeywordRouter {
                         if (raw.contains("\"code\":0")) "✅ 机卡重绑已提交成功"
                         else "📋 重绑提交结果：\n${raw.take(300)}"
                     }
-                    send(resultText)
+                    send("$resultText\n$idTypeLabel：$iccid")
                 }
             }
             } // withLock

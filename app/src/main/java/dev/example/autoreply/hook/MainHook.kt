@@ -119,6 +119,8 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 val talker = target.talker ?: continue
                 val content = target.content ?: continue
 
+                // 提取发送者 wxid（群聊消息格式：wxid_xxx:\n@昵称 正文）
+                val senderWxId = Regex("^(wxid_\\w+):").find(content)?.groupValues?.get(1)
                 val text = content.replaceFirst(Regex("^wxid_\\w+:"), "")
                     .replaceFirst(Regex("^@\\S+[\\s\u2005]+"), "")
                     .trim()
@@ -141,11 +143,31 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     if (!atMe) {
                         atMe = WeDatabaseApi.isAtMe(target.msgSvrId, hook.selfWxId)
                     }
+                    // 兜底：内容中包含 @机器人昵称（手动打的 @，无 atuserlist）
+                    if (!atMe) {
+                        val selfWxId = hook.selfWxId
+                        val selfNick = selfWxId?.let { WeDatabaseApi.getNickname(it) }
+                        atMe = selfNick != null && content.contains("@$selfNick")
+                    }
                     if (!atMe) {
                         XposedBridge.log("[AutoReply] skipped: group message not @me (talker=$talker)")
                         continue
                     }
                     XposedBridge.log("[AutoReply] group @me detected: talker=$talker")
+                }
+
+                // 群聊回复包装：@昵称 + 回复内容
+                fun wrapReply(replyText: String): String {
+                    if (!isGroup || senderWxId == null) return replyText
+                    val nickname = WeDatabaseApi.getNickname(senderWxId) ?: senderWxId
+                    return "@$nickname\n$replyText"
+                }
+
+                // 群聊回复前设置真实 @ 通知目标
+                fun pendAt() {
+                    if (isGroup && senderWxId != null) {
+                        AtMentionHook.pend(talker, senderWxId)
+                    }
                 }
 
                 // ---- CTWing keyword routing ----
@@ -154,7 +176,8 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     XposedBridge.log("[AutoReply] CTWing delay ${delayMs}ms")
                     kotlinx.coroutines.delay(delayMs)
                     XposedBridge.log("[AutoReply] CTWing reply: $replyText")
-                    hook.sendText(talker, replyText)
+                    pendAt()
+                    hook.sendText(talker, wrapReply(replyText))
                 }
                 if (ctwHandled) continue
 
@@ -176,7 +199,8 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 kotlinx.coroutines.delay(delayMs)
 
                 XposedBridge.log("[AutoReply] sending reply: ${reply.take(60)}…")
-                hook.sendText(talker, reply)
+                pendAt()
+                hook.sendText(talker, wrapReply(reply))
             } // end for deduped
         }
 
@@ -186,6 +210,9 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
         // ---- 白名单：初始化数据库 + hook 微信主界面弹选择器 ----
         installWhitelistPicker(lpparam.classLoader, scope)
+
+        // ---- 群聊真实 @ 通知：Hook 消息入库 + 注入 atuserlist ----
+        AtMentionHook.init(lpparam.classLoader)
 
         // Start token keep-alive
         dev.example.autoreply.ctwing.TokenKeepAlive.start(scope)
