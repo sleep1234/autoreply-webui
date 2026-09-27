@@ -2,7 +2,6 @@ package dev.example.autoreply.ui
 
 import android.content.Context
 import android.content.SharedPreferences
-import de.robv.android.xposed.XposedBridge
 import java.io.File
 
 data class WhitelistEntry(val id: String, val name: String, val isGroup: Boolean)
@@ -66,15 +65,11 @@ object WhitelistStore {
 
     // ---- 白名单读取 ----
     fun list(): List<WhitelistEntry> {
-        // 1. 模块 dataDir 文件（主存储）
         val f = moduleFile("autoreply_whitelist.json")
-        XposedBridge.log("[Whitelist] list() path=${f.absolutePath} exists=${f.exists()}")
         if (f.exists()) {
             val raw = runCatching { f.readText() }.getOrNull()
-            XposedBridge.log("[Whitelist] list() raw=$raw")
             if (!raw.isNullOrBlank()) return decode(raw)
         }
-        // 2. 空数组兜底
         return emptyList()
     }
 
@@ -82,8 +77,7 @@ object WhitelistStore {
     fun setList(entries: List<WhitelistEntry>) {
         val json = encode(entries)
         val f = moduleFile("autoreply_whitelist.json")
-        val ok = runCatching { f.writeText(json) }.isSuccess
-        XposedBridge.log("[Whitelist] setList() path=${f.absolutePath} ok=$ok json=$json")
+        runCatching { f.writeText(json) }
     }
 
     fun add(id: String, name: String, isGroup: Boolean) {
