@@ -153,19 +153,18 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 }
                 if (ctwHandled) continue
 
-                // ---- Fallback keyword replies ----
-                val reply = when {
-                    text.contains("在吗") -> "在的，自动回复"
-                    text.contains("帮助") || text.contains("help") -> """
-                    🤖 自动回复帮助：
-                    · 查询 <ICCID> — 查询卡基本信息
-                    · 诊断 <ICCID> — 智能诊断
-                    · 重绑 <ICCID> <IMEI> — 机卡重绑
-                    · 环境 — 诊断 SPA 环境（调试用）
-                    · 在吗 — 测试自动回复
+                // 非 CTWing 命令 → 统一回复使用帮助
+                val reply = """
+                    🤖 欢迎使用天翼物联一站式服务工具！
+                    
+                    📋 可用命令：
+                    · 查询 ICCID或接入号 — 查询卡片详情
+                    · 诊断 ICCID或接入号 — 诊断卡片情况
+                    · 重绑 ICCID或接入号 — 机卡重绑
+                    
+                    💡 使用方式：@我 + 命令，例如：
+                    @我 查询 89860012345678901234
                 """.trimIndent()
-                    else -> "已收到：「$text」——这是自动回复 🤖\n发送「帮助」查看可用命令"
-                }
 
                 val delayMs = (2_000L..5_000L).random()
                 XposedBridge.log("[AutoReply] delaying ${delayMs}ms before reply")
