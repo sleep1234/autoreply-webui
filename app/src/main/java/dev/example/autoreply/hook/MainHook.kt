@@ -186,12 +186,13 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
         // Start token keep-alive
         dev.example.autoreply.ctwing.TokenKeepAlive.start(scope)
 
-        // ★ PRE-INIT H5 on startup (screen must be on — user just opened WeChat).
-        // Completes OAuth silently, steals WebView into overlay pool.
-        // Lock-screen queries then use the already-stolen WebView directly.
+        // ★ 自建不可见 WebView —— 方向B已证失败，恢复偷取方案。
+        // 结论：pinus.sdk.WebView 裸 new + addView 会在 View 布局(sizeChange→
+        // onCheckIsTextEditor)时 NPE，因为 reflectInterface 委托必须先由 Pinus
+        // 内核(经微信 MMWebViewUI 初始化流程)注入。自建 WebView 不可行。
         scope.launch {
-            kotlinx.coroutines.delay(5_000L)  // let WeChat finish initializing
-            XposedBridge.log("[AutoReply] pre-init: launching H5 for WebViewPool steal…")
+            kotlinx.coroutines.delay(8_000L)
+            XposedBridge.log("[AutoReply] init: using preInitH5 steal path")
             dev.example.autoreply.ctwing.CtwingFacade.preInitH5()
         }
     }

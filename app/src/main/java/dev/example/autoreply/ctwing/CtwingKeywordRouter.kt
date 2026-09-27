@@ -162,6 +162,12 @@ object CtwingKeywordRouter {
                         null
                     }
                     CtwingFacade.releaseWakeLock()
+                    // 先检测业务错误（code!=0, data=null）——如"不在查询范围"
+                    val errorMsg = raw?.let { extractQueryError(it) }
+                    if (errorMsg != null) {
+                        send("⚠️ 查询失败：$errorMsg")
+                        return@withLock
+                    }
                     val bestResp = raw?.let { extractBestResponse(it) }
                     if (bestResp != null) send(formatCardInfo(bestResp))
                     else send("⚠️ 查询未完成：${(raw ?: "null").take(120)}")
@@ -305,6 +311,24 @@ object CtwingKeywordRouter {
             Regex("^\\d{15}$").matches(normalized) -> "imsi"
             else -> "iccid"
         }
+    }
+
+    /**
+     * 检测 CTWing API 返回的业务级错误（code!=0 且 msg 有意义）。
+     * 只匹配明确的错误场景（如"不在查询范围"），不拦截正常响应。
+     * 返回 null 表示不是业务错误，继续正常解析。
+     */
+    private fun extractQueryError(raw: String): String? {
+        return try {
+            val root = org.json.JSONObject(raw)
+            val code = root.optInt("code", 0)
+            val msg = root.optString("msg", "")
+            val data = root.opt("data")
+            if (code != 0 && msg.isNotBlank() && (data == null || data === org.json.JSONObject.NULL)) {
+                // 友好化：把"不在您的查询范围内"改成"非台州电信开卡"
+                msg.replace("不在您的查询范围内", "非台州电信开卡")
+            } else null
+        } catch (_: Exception) { null }
     }
 
     /**

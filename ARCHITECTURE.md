@@ -22,7 +22,7 @@
 │    │                                                              │
 │    ├─ PopupMenuHook: "+"菜单注入白名单入口                          │
 │    ├─ TokenKeepAlive: 25分钟 token 心跳                            │
-│    └─ 启动时 preInitH5: 偷 WebView 到后台池                        │
+│    └─ 方案A: 静默启动 (NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -310,26 +310,34 @@ val cookie = obj?.optString("cookie", "") ?: ""
 
 ---
 
-## 八、H5 生命周期管理
+## 八、H5 生命周期管理（方案A：静默后台）
 
-### 8.1 启动预初始化
+### 8.1 启动流程
 
 ```kotlin
-// MainHook.kt
-scope.launch {
-    delay(5_000L)
-    CtwingFacade.preInitH5()   // 打开 CTWing URL, 完成 OAuth
+// MainHook.kt → CtwingFacade.preInitH5()
+scope.launch { delay(8_000L); CtwingFacade.preInitH5() }
+
+// CtwingFacade.rebuildH5()
+Intent(MMWebViewUI).apply {
+    addFlags(NEW_TASK | FLAG_ACTIVITY_NEW_DOCUMENT | FLAG_ACTIVITY_MULTIPLE_TASK)
+    // H5 在独立任务栈打开——用户当前任务栈不受影响，微信首页不抢夺
 }
 ```
 
-### 8.2 WebView 偷取 (WebViewPool)
+### 8.2 WebView 偷取 + 退后台
 
 ```
-MMWebViewUI.onResume → WebViewPool.steal(webView)
-  → 创建透明 overlay window
-  → webView 从原 parent detach → 添加到 overlay
-  → 原 parent 隐藏 (gone)
+MMWebViewUI 创建（独立任务栈，用户无感）
+  → onResume → view tree scan → 找到 CTWing WebView
+  → WebViewPool.steal(webView)
+       → detach 从 MMWebViewUI
+       → 挂到透明 overlay (alpha=0, not_touchable)
+  → moveTaskToBack(true)  ← MMWebViewUI 空壳退后台
+  → 用户看到微信首页，H5 在 overlay 里继续运行
 ```
+
+关键：用 `moveTaskToBack` 而非 `finish()`——finish 会暂停 WebView 渲染器，导致 pullToken 超时。
 
 ### 8.3 TokenKeepAlive (25分钟)
 

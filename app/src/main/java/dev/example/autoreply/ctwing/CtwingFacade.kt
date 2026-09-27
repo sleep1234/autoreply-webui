@@ -304,7 +304,6 @@ object CtwingFacade {
         CtwingJsBridge.isPageReady = false
         CtwingJsBridge.lastApiResponse = null
         CtwingWebViewHook.resetForRebuild()
-        CtwingWebViewHook.silentMoveBack = true
         rebuildH5()
 
         // Poll findForHost every 3s until OAuth → SPA completes
@@ -312,12 +311,17 @@ object CtwingFacade {
         while (System.currentTimeMillis() < deadline) {
             kotlinx.coroutines.delay(3_000L)
             if (CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn") != null) {
-                CtwingWebViewHook.silentMoveBack = false
+                // 方案A：WebView已偷取到overlay，把空壳MMWebViewUI推到后台
+                // 不finish——finish会暂停WebView渲染器，导致pullToken超时
+                val activities = CtwingWebViewHook.findActivitiesByClassName("MMWebViewUI")
+                for (act in activities) {
+                    act.runOnUiThread { act.moveTaskToBack(true) }
+                    XposedBridge.log("$TAG silent: moved ${act.javaClass.simpleName} to back")
+                }
                 XposedBridge.log("$TAG H5 rebuild: found via findForHost")
                 return true
             }
         }
-        CtwingWebViewHook.silentMoveBack = false
         XposedBridge.log("$TAG H5 rebuild: timeout")
         return false
     }
@@ -354,7 +358,6 @@ object CtwingFacade {
             val intent = android.content.Intent().apply {
                 setClassName("com.tencent.mm", "com.tencent.mm.plugin.webview.ui.tools.MMWebViewUI")
                 putExtra("rawUrl", oauthUrl)
-                // Simulate 公众号 menu entry (triggers silent OAuth)
                 putExtra("preUsername", "gh_cc1856f69ee1")
                 putExtra("preChatName", "gh_cc1856f69ee1")
                 putExtra("pre_username", "gh_cc1856f69ee1")
@@ -365,13 +368,11 @@ object CtwingFacade {
                 putExtra("from_scence", 1)
                 putExtra("showShare", false)
                 putExtra("show_bottom", false)
-                // Screen is ON during pre-init (WeChat just started), so
-                // NO_USER_ACTION is enough — Activity renders in background,
-                // never steals focus, and gets stolen into the overlay pool.
-                // Lock-screen queries use reloadOAuthOnPool() which issues
-                // loadUrl directly on the pool WebView, no Activity needed.
+                // WechatMultiWebview 方案：H5 打开在独立任务栈，不抢微信前台
+                // NEW_DOCUMENT + MULTIPLE_TASK → MMWebViewUI 独立窗口，用户无感
                 addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
-                    or 0x00010000  // FLAG_ACTIVITY_NO_USER_ACTION
+                    or android.content.Intent.FLAG_ACTIVITY_NEW_DOCUMENT
+                    or android.content.Intent.FLAG_ACTIVITY_MULTIPLE_TASK
                 )
             }
             ctx.startActivity(intent)

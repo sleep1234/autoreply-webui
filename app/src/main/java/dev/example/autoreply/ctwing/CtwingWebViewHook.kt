@@ -695,9 +695,6 @@ object CtwingWebViewHook {
     @Volatile
     private var uiTreeScanDone = false
 
-    @Volatile
-    var silentMoveBack = false  // when true, move CTWing activity to back on resume
-
     private fun hookActivityResumeForInjection(classLoader: ClassLoader) {
         // Hook MMWebViewUI.onResume — every time the H5 page comes to
         // foreground we scan its view tree for a WebView holding a CTWing URL.
@@ -707,17 +704,11 @@ object CtwingWebViewHook {
         for (cname in actClassNames) {
             runCatching {
                 val cls = XposedHelpers.findClass(cname, classLoader)
+
                 XposedHelpers.findAndHookMethod(cls, "onResume",
                     object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             val activity = param.thisObject as? android.app.Activity ?: return
-                            // Silent mode: move task to back so user never sees it
-                            if (silentMoveBack) {
-                                try {
-                                    activity.moveTaskToBack(true)
-                                    log("silent: moved ${cname} to back")
-                                } catch (_: Exception) {}
-                            }
                             // Re-scan EVERY resume: after login navigation the
                             // WebView context changes, so we must re-inject.
                             mainHandler.postDelayed({
@@ -873,5 +864,24 @@ object CtwingWebViewHook {
             val currentAt = atClass.getMethod("currentActivityThread").invoke(null)
             currentAt.javaClass.getMethod("getApplication").invoke(currentAt) as? android.content.Context
         } catch (_: Exception) { null }
+    }
+
+    /** Find ALL activities (not just top) via ActivityThread, including paused. */
+    fun findActivitiesByClassName(classNamePartial: String): List<android.app.Activity> {
+        return try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val currentAt = atClass.getMethod("currentActivityThread").invoke(null)
+            val activitiesField = currentAt.javaClass.getDeclaredField("mActivities")
+            activitiesField.isAccessible = true
+            val activities = activitiesField.get(currentAt) as? Map<*, *> ?: return emptyList()
+            activities.values.mapNotNull { record ->
+                try {
+                    val actField = record?.javaClass?.getDeclaredField("activity")
+                    actField?.isAccessible = true
+                    val act = actField?.get(record) as? android.app.Activity
+                    act?.takeIf { it.javaClass.name.contains(classNamePartial) }
+                } catch (_: Exception) { null }
+            }
+        } catch (_: Exception) { emptyList() }
     }
 }
