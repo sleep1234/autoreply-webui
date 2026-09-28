@@ -53,6 +53,17 @@ object TokenKeepAlive {
             }
             return
         }
+        // WebView 被杀时：先静默重建，再拉新 token
+        XposedBridge.log("$TAG pool WebView dead, rebuilding H5 silently…")
+        if (!CtwingFacade.ensureReady(40_000L)) {
+            XposedBridge.log("$TAG rebuild failed, falling back to basicInfo")
+        } else {
+            kotlinx.coroutines.delay(2_000L)
+            if (CtwingFacade.pullToken()) {
+                XposedBridge.log("$TAG token refreshed via rebuild")
+                return
+            }
+        }
         // Fallback: direct HTTP basicInfo to slide TTL
         val token = NativeHttp.cachedToken ?: return
         XposedBridge.log("$TAG refreshing token via basicInfo...")

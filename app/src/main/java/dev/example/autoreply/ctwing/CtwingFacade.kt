@@ -33,6 +33,9 @@ object CtwingFacade {
      */
     val webViewMutex = Mutex()
 
+    /** 重建互斥锁：防止 pullTokenOrRebuild 与 TokenKeepAlive 并发重建，导致多窗口叠加。 */
+    private val rebuildMutex = Mutex()
+
     // ------------------------------------------------------------------
     //  callJs — dispatches via local WebView or IPC
     // ------------------------------------------------------------------
@@ -139,30 +142,10 @@ object CtwingFacade {
      */
     suspend fun pullToken(): Boolean {
         return try {
-            // Inline self-contained JS — does NOT depend on window.__ctwing.
-            // Reads ACCESS_TOKEN from cookie/localStorage/sessionStorage directly.
-            val script = """
-                (function(){
-                    try {
-                        var token = (document.cookie.match(/ACCESS_TOKEN=([^;]+)/)||[])[1] || '';
-                        var bond = (document.cookie.match(/ctl-dync-ct-bond=([^;]+)/)||[])[1] || '';
-                        if (!token) { try { token = sessionStorage.getItem('ACCESS_TOKEN') || localStorage.getItem('ACCESS_TOKEN') || ''; } catch(e){} }
-                        return JSON.stringify({token:token,bond:bond,cookie:document.cookie||''});
-                    } catch(e) { return JSON.stringify({error:e.message}); }
-                })()
-            """.trimIndent()
-            val raw = callJs(script)
-            XposedBridge.log("$TAG pullToken raw len=${raw.length}: ${raw.take(120)}")
-            // raw 是 JSON 字符串（可能双重转义），用 JSONObject 解析最稳
-            val obj = runCatching {
-                // 先尝试直接解析，失败则剥一层引号再解析
-                org.json.JSONObject(raw)
-            }.recoverCatching {
-                org.json.JSONObject(org.json.JSONTokener(raw).nextValue() as String)
-            }.getOrNull()
-            val token = obj?.optString("token", "") ?: ""
-            val bond = obj?.optString("bond", "") ?: ""
-            val cookie = obj?.optString("cookie", "") ?: ""
+            val obj = pullTokenRaw() ?: return false
+            val token = obj.optString("token", "")
+            val bond = obj.optString("bond", "")
+            val cookie = obj.optString("cookie", "")
             if (token.isNotBlank()) {
                 NativeHttp.cachedToken = token
                 XposedBridge.log("$TAG pullToken: token captured (${token.length} chars)")
@@ -180,6 +163,40 @@ object CtwingFacade {
             XposedBridge.log("$TAG pullToken failed: ${e.message}")
             false
         }
+    }
+
+    /** pullToken + 兜底重建：WebView 被杀时自动静默重建后重试。 */
+    suspend fun pullTokenOrRebuild(): Boolean {
+        if (pullToken()) return true
+        XposedBridge.log("$TAG pullToken failed, rebuilding H5 silently…")
+        if (!ensureReady(40_000L)) {
+            XposedBridge.log("$TAG rebuild failed, giving up")
+            return false
+        }
+        kotlinx.coroutines.delay(2_000L)
+        return pullToken()
+    }
+
+    /** 从 SPA 读 cookie/localStorage 并解析成 JSONObject（不含缓存写入）。 */
+    private suspend fun pullTokenRaw(): org.json.JSONObject? {
+        val script = """
+            (function(){
+                try {
+                    var token = (document.cookie.match(/ACCESS_TOKEN=([^;]+)/)||[])[1] || '';
+                    var bond = (document.cookie.match(/ctl-dync-ct-bond=([^;]+)/)||[])[1] || '';
+                    if (!token) { try { token = sessionStorage.getItem('ACCESS_TOKEN') || localStorage.getItem('ACCESS_TOKEN') || ''; } catch(e){} }
+                    return JSON.stringify({token:token,bond:bond,cookie:document.cookie||''});
+                } catch(e) { return JSON.stringify({error:e.message}); }
+            })()
+        """.trimIndent()
+        val raw = callJs(script)
+        XposedBridge.log("$TAG pullToken raw len=${raw.length}: ${raw.take(120)}")
+        // raw 是 JSON 字符串（可能双重转义），用 JSONObject 解析最稳
+        return runCatching {
+            org.json.JSONObject(raw)
+        }.recoverCatching {
+            org.json.JSONObject(org.json.JSONTokener(raw).nextValue() as String)
+        }.getOrNull()
     }
     /** Read last API capture — fast bridge check first, then short evaluateJavascript fallback. */
     suspend fun readApiResponses(): String {
@@ -299,31 +316,52 @@ object CtwingFacade {
     }
 
     private suspend fun rebuildAndWait(timeoutMs: Long): Boolean {
-        XposedBridge.log("$TAG H5 appears dead, rebuilding silently...")
-        acquireWakeLock()
-        CtwingJsBridge.isPageReady = false
-        CtwingJsBridge.lastApiResponse = null
-        CtwingWebViewHook.resetForRebuild()
-        rebuildH5()
-
-        // Poll findForHost every 3s until OAuth → SPA completes
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            kotlinx.coroutines.delay(3_000L)
+        return rebuildMutex.withLock {
+            // 二次检查：等锁期间可能已被其他协程修好
             if (CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn") != null) {
-                // 方案A：WebView已偷取到overlay，把空壳MMWebViewUI推到后台
-                // 不finish——finish会暂停WebView渲染器，导致pullToken超时
-                val activities = CtwingWebViewHook.findActivitiesByClassName("MMWebViewUI")
-                for (act in activities) {
-                    act.runOnUiThread { act.moveTaskToBack(true) }
-                    XposedBridge.log("$TAG silent: moved ${act.javaClass.simpleName} to back")
-                }
-                XposedBridge.log("$TAG H5 rebuild: found via findForHost")
-                return true
+                XposedBridge.log("$TAG rebuild: already ready (fixed while waiting lock)")
+                return@withLock true
             }
+
+            XposedBridge.log("$TAG H5 appears dead, rebuilding silently...")
+            acquireWakeLock()
+            CtwingJsBridge.isPageReady = false
+            CtwingJsBridge.lastApiResponse = null
+            CtwingWebViewHook.resetForRebuild()
+            rebuildH5()
+
+            // Poll findForHost every 3s until OAuth → SPA completes
+            val deadline = System.currentTimeMillis() + timeoutMs
+            var ok = false
+            while (System.currentTimeMillis() < deadline) {
+                kotlinx.coroutines.delay(3_000L)
+                if (CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn") != null) {
+                    // WebView 已偷取到 overlay。清理残留空壳窗口：
+                    // - 保留最新一个 MMWebViewUI 用 moveTaskToBack（保活渲染器）
+                    // - finish 掉多余的旧壳（NEW_DOCUMENT 每次建新窗口不会自动杀旧的）
+                    val activities = CtwingWebViewHook.findActivitiesByClassName("MMWebViewUI")
+                    if (activities.size > 1) {
+                        // 多余旧壳 → finish（WebView 已偷走，空壳 finish 不影响渲染器）
+                        for (act in activities.dropLast(1)) {
+                            if (!act.isFinishing && !act.isDestroyed) {
+                                act.runOnUiThread { act.finish() }
+                                XposedBridge.log("$TAG cleanup: finished stale ${act.javaClass.simpleName}")
+                            }
+                        }
+                    }
+                    // 最新一个 → moveTaskToBack 保活
+                    activities.lastOrNull()?.let { act ->
+                        act.runOnUiThread { act.moveTaskToBack(true) }
+                        XposedBridge.log("$TAG silent: moved ${act.javaClass.simpleName} to back")
+                    }
+                    XposedBridge.log("$TAG H5 rebuild: found via findForHost")
+                    ok = true
+                    break
+                }
+            }
+            if (!ok) XposedBridge.log("$TAG H5 rebuild: timeout")
+            ok
         }
-        XposedBridge.log("$TAG H5 rebuild: timeout")
-        return false
     }
 
     /**
@@ -376,7 +414,7 @@ object CtwingFacade {
                 )
             }
             ctx.startActivity(intent)
-            XposedBridge.log("$TAG rebuild: OAuth MMWebViewUI dispatched (NO_USER_ACTION, pool steal)")
+            XposedBridge.log("$TAG rebuild: OAuth MMWebViewUI dispatched (NEW_DOCUMENT+MULTIPLE_TASK, pool steal)")
         } catch (e: Exception) {
             XposedBridge.log("$TAG rebuild failed: ${e.message}")
         }
@@ -436,98 +474,6 @@ object CtwingFacade {
         val bindType: String
     )
 
-    /**
-     * Self-contained sync-XHR query — ONE evaluateJavascript call.
-     * Reads cookie, fires sync XMLHttpRequest, returns JSON result directly.
-     * No window.__ctwing / cross-isolate state needed.
-     */
-    suspend fun queryCardSync(iccid: String, type: String): String? {
-        acquireWakeLock()
-        val script = """
-            (function(){
-                try {
-                    var id = '${escapeJs(iccid)}';
-                    var t = '$type';
-                    var token = (document.cookie.match(/ACCESS_TOKEN=([^;]+)/)||[])[1] || '';
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('GET', '/webapp-font/admin-api/bpm/service-assistant/querySimBaseInfo?type='+t+'&id='+id, false);
-                    xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
-                    if (token) xhr.setRequestHeader('Authorization', 'Bearer ' + token);
-                    xhr.send();
-                    return JSON.stringify({status: xhr.status, body: xhr.responseText});
-                } catch(e) { return JSON.stringify({error: e.message || String(e)}); }
-            })()
-        """.trimIndent()
-        return try {
-            val raw = callJsLocal(script)
-            XposedBridge.log("$TAG queryCardSync raw len=${raw?.length ?: 0}: ${raw?.take(100) ?: "null"}")
-            raw
-        } catch (e: Exception) {
-            XposedBridge.log("$TAG queryCardSync failed: ${e.message}")
-            null
-        }
-    }
-    suspend fun diagnoseCard(iccid: String): String {
-        CtwingJsBridge.lastApiResponse = null
-        acquireWakeLock()
-        fireJs("window.__ctwing.diagnoseCard('${escapeJs(iccid)}')")
-        return "dispatched"
-    }
-
-    /** Sync-XHR diagnosis — ONE evaluateJavascript call, returns JSON directly (like queryCardSync). */
-    suspend fun diagnoseCardSync(iccid: String): String? {
-        acquireWakeLock()
-        val script = """
-            (function(){
-                try {
-                    var id = '${escapeJs(iccid)}';
-                    if (id.length === 20 && id.charAt(0) === '8') id = id.substring(0, 19);
-                    var type = 'iccid';
-                    if (/^1[0-9]{10,12}${'$'}/.test(id)) type = 'msisdn';
-                    else if (/^\d{15}${'$'}/.test(id)) type = 'imsi';
-                    var token = (document.cookie.match(/ACCESS_TOKEN=([^;]+)/)||[])[1] || '';
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('GET', '/webapp-font/admin-api/bpm/service-assistant/intelligentDiagnosis?type='+type+'&id='+id, false);
-                    xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
-                    if (token) xhr.setRequestHeader('Authorization', 'Bearer ' + token);
-                    xhr.send();
-                    return JSON.stringify({status: xhr.status, body: xhr.responseText});
-                } catch(e) { return JSON.stringify({error: e.message || String(e)}); }
-            })()
-        """.trimIndent()
-        return try {
-            callJsLocal(script)
-        } catch (e: Exception) {
-            XposedBridge.log("$TAG diagnoseCardSync failed: ${e.message}")
-            null
-        }
-    }
-
-    /** Sync-XHR operationCommit — ONE evaluateJavascript call, returns JSON directly. */
-    suspend fun operationCommitSync(payload: String): String? {
-        acquireWakeLock()
-        val escaped = escapeJs(payload)
-        val script = """
-            (function(){
-                try {
-                    var token = (document.cookie.match(/ACCESS_TOKEN=([^;]+)/)||[])[1] || '';
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('POST', '/webapp-font/admin-api/bpm/service-assistant/operationCommit', false);
-                    xhr.setRequestHeader('Content-Type', 'application/json');
-                    if (token) xhr.setRequestHeader('Authorization', 'Bearer ' + token);
-                    xhr.send('$escaped');
-                    return JSON.stringify({status: xhr.status, body: xhr.responseText});
-                } catch(e) { return JSON.stringify({error: e.message || String(e)}); }
-            })()
-        """.trimIndent()
-        return try {
-            callJsLocal(script)
-        } catch (e: Exception) {
-            XposedBridge.log("$TAG operationCommitSync failed: ${e.message}")
-            null
-        }
-    }
-
     /** Release wake lock after result is read (called by router when done). */
     fun releaseWakeLock() {
         try {
@@ -571,25 +517,19 @@ object CtwingFacade {
     }
 
     /** Execute JS via evaluateJavascript (null callback) — fire-and-forget.
-     *  Falls back to lazy injection if the WebView ref was lost (e.g. after
-     *  OAuth re-auth where wxLogin skipped the initial injection). */
-    private fun fireJs(script: String) {
+     *  WebView 引用丢失时先静默重建，再执行。 */
+    private suspend fun fireJs(script: String) {
         val clean = script.removePrefix("javascript:")
         var wv = CtwingWebViewHook.currentWebView()
         if (wv == null) {
-            XposedBridge.log("$TAG fireJs: targetView null, trying lazy inject")
-            if (CtwingWebViewHook.isInjected()) {
-                wv = CtwingWebViewHook.currentWebView() ?: run {
-                    XposedBridge.log("$TAG fireJs: still null after lazy inject, abort")
-                    return
-                }
-            } else {
-                XposedBridge.log("$TAG fireJs: isInjected false, re-scanning")
-                CtwingWebViewHook.forceRescan()
-                wv = CtwingWebViewHook.currentWebView() ?: run {
-                    XposedBridge.log("$TAG fireJs: no WebView after rescan, abort")
-                    return
-                }
+            XposedBridge.log("$TAG fireJs: targetView null, rebuilding H5 silently…")
+            if (!ensureReady(40_000L)) {
+                XposedBridge.log("$TAG fireJs: rebuild failed, abort")
+                return
+            }
+            wv = CtwingWebViewHook.currentWebView() ?: run {
+                XposedBridge.log("$TAG fireJs: still null after rebuild, abort")
+                return
             }
         }
         // Use evaluateJavascript — the SAME API as evaluateJsForResult,

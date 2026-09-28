@@ -23,6 +23,11 @@
 | 13 | **群聊回复 @ 发起者 + 真实 @ 通知** | 普通 sendText 无 @；纯文本 @ 无服务器提醒 | AtMentionHook 入库前注入 atuserlist + wrapReply 加 @昵称 |
 | 14 | **重绑结果回显卡号** | 结果只显示工单号，群聊难对应 | 结果末尾追加 ICCID/接入号/IMSI 标签 + 号码 |
 | 15 | **手动 @（普通空格）不被识别** | 微信 @ 靠 atuserlist，手动打 @ 无此数据 | 兜底检测 content 含 @自身昵称 |
+| 16 | **WebView 被杀后无自动恢复** | pullToken/fireJs 失败时只抛异常，不重建 | pullTokenOrRebuild 兜底 + fireJs 兜底重建 + TokenKeepAlive 重建 |
+| 17 | **死代码清理** | queryCardSync/diagnoseCardSync/operationCommitSync 同步 XHR 不可用 | 删除三个 Sync 方法（~90 行） |
+| 18 | **重绑 XHR 回调不触发（双开）** | X5 后台 JS 事件循环被挂起，onreadystatechange 不执行 | 6 秒轮询超时后 fallback NativeHttp POST（带 cachedCookie） |
+| 19 | **并发重建导致多窗口叠加** | pullTokenOrRebuild 与 TokenKeepAlive 同时 rebuildAndWait，无锁保护 | rebuildAndWait 加 rebuildMutex 互斥锁 + 二次检查 |
+| 20 | **旧 MMWebViewUI 空壳堆积** | NEW_DOCUMENT 每次建新窗口，旧壳不自动关 | 偷取后 finish 多余旧壳（dropLast(1)），只保留最新一个 moveTaskToBack |
 
 ---
 
@@ -168,3 +173,54 @@ rebuildAndWait:
 **可以安全修改**：`CtwingKeywordRouter.kt` 格式化/文案、`MainHook.kt` 欢迎回复、`AndroidManifest.xml` 元信息
 
 **需要谨慎**：`CtwingFacade.kt` pullToken/rebuildH5、`CtwingWebViewHook.kt` WebView 定位、`WebViewPool.kt` overlay 创建、`NativeHttp.kt` HTTP 请求、`AtMentionHook.kt` DexKit 解析与 atuserlist 注入
+
+---
+
+## 七、当前功能全景与运行逻辑（2026-09-28 版）
+
+### 7.1 功能清单
+
+| 功能 | 状态 |
+|------|------|
+| 查询（ICCID/接入号） | ✅ NativeHttp GET |
+| 诊断（ICCID/接入号） | ✅ NativeHttp GET |
+| 重绑（ICCID/接入号/IMSI） | ✅ WebView XHR + NativeHttp fallback |
+| 群聊 @ 发起者（真实通知） | ✅ AtMentionHook 注入 atuserlist |
+| 群聊引用原文 | ❌ 已移除（用户要求不重复原文） |
+| 重绑回显卡号 | ✅ 结果末尾追加类型标签+号码 |
+| 白名单 | ✅ 空=不回复，非空=只回复列表内 |
+| 后台静默 | ✅ NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack |
+| WebView 被杀自动恢复 | ✅ pullTokenOrRebuild + fireJs 兜底 + TokenKeepAlive 兜底 |
+| 防并发重建 | ✅ rebuildMutex 互斥锁 |
+| 防窗口堆积 | ✅ finish 多余旧壳，保留一个 |
+| 模块元信息 | ✅ 天翼物联一站式服务工具 / 无桌面图标 / 静态 scope |
+
+### 7.2 正常运行逻辑
+
+**启动阶段**（微信启动后 ~8 秒）：
+1. 模块加载 → 消息捕获引擎 + 白名单 + AtMention 初始化
+2. `preInitH5()`：静默打开 CTWing OAuth（独立任务栈）→ 偷取 WebView 到透明 overlay → moveTaskToBack
+3. `pullToken()` 拉取 ACCESS_TOKEN 缓存
+4. `TokenKeepAlive` 每 25 分钟保活 token
+
+**消息处理阶段**（收到消息）：
+```
+消息捕获 → 去重 → 白名单过滤 → 群聊 @ 检测
+  → 关键词路由：
+      查询/诊断：pullTokenOrRebuild → NativeHttp GET → 格式化回复
+      重绑：pullTokenOrRebuild → WebView XHR（fallback NativeHttp）→ 格式化回复
+      其他：统一欢迎帮助信息
+  → 群聊回复：@昵称 + 真实 @ 通知
+```
+
+**异常恢复阶段**（WebView 被杀）：
+```
+pullToken 失败 → ensureReady → rebuildAndWait（rebuildMutex 锁）
+  → 静默重建 → finish 旧壳 + moveTaskToBack 新壳 → 重拉 token
+```
+
+### 7.3 双开/多用户支持
+
+- 白名单存 `{微信dataDir}/files/autoreply/`，每个 user 独立（主空间 `/data/user/0/`，双开 `/data/user/999/`）
+- Token 存 `{微信dataDir}/dsh_ctwing_bundles/`，同样按 user 隔离
+- 需在 LSPosed 中对双开微信单独勾选作用域

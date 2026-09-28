@@ -13,8 +13,8 @@ android {
         applicationId = "dev.example.autoreply"
         minSdk = 28
         targetSdk = 35
-        versionCode = 2026092709
-        versionName = "2026.09.27.9"
+        versionCode = 2026092802
+        versionName = "2026.09.28.2"
     }
 
     buildTypes {

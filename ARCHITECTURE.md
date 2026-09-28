@@ -342,16 +342,39 @@ MMWebViewUI 创建（独立任务栈，用户无感）
   → WebViewPool.steal(webView)
        → detach 从 MMWebViewUI
        → 挂到透明 overlay (alpha=0, not_touchable)
-  → moveTaskToBack(true)  ← MMWebViewUI 空壳退后台
+  → 窗口清理：
+       - finish 掉多余的旧 MMWebViewUI 空壳（NEW_DOCUMENT 每次建新窗口）
+       - 保留最新一个 moveTaskToBack(true) 退后台保活
   → 用户看到微信首页，H5 在 overlay 里继续运行
 ```
 
-关键：用 `moveTaskToBack` 而非 `finish()`——finish 会暂停 WebView 渲染器，导致 pullToken 超时。
+关键：
+- 用 `moveTaskToBack` 而非 `finish()` 保留最新壳——finish 会暂停 WebView 渲染器，导致 pullToken 超时
+- 但**多余的旧壳**（WebView 已被偷走、只剩空 Activity）必须 finish，否则任务管理器堆积窗口
 
-### 8.3 TokenKeepAlive (25分钟)
+### 8.3 重建互斥（防并发多窗口）
+
+`rebuildAndWait` 用 `rebuildMutex` 互斥锁保护，防止 `pullTokenOrRebuild` 与 `TokenKeepAlive` 同时检测到 WebView 死亡并发重建：
+
+```
+rebuildMutex.withLock {
+  // 二次检查：等锁期间可能已被其他协程修好
+  if (findForHost("tywlonestop.ctwing.cn") != null) return true
+  
+  rebuildH5()          // 开新 MMWebViewUI
+  轮询 findForHost     // 等 OAuth → SPA 完成
+  finish 多余旧壳       // 窗口清理
+  moveTaskToBack 最新   // 保活
+}
+```
+
+锁顺序始终 `webViewMutex` → `rebuildMutex`（单向），无死锁。
+
+### 8.4 TokenKeepAlive (25分钟)
 
 首选: `WebViewPool.onResume()` 触发 SPA router.push → OAuth 刷新
-兜底: `NativeHttp.basicInfo()` 滑动 TTL
+兜底: WebView 死亡 → `ensureReady()` 重建 → 重拉 token
+最后: `NativeHttp.basicInfo()` 滑动 TTL
 
 ---
 

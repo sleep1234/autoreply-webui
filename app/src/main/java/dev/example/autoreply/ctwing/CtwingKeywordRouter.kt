@@ -152,7 +152,7 @@ object CtwingKeywordRouter {
             when (op) {
                 "query" -> {
                     kotlinx.coroutines.delay(2_000L)
-                    CtwingFacade.pullToken()
+                    CtwingFacade.pullTokenOrRebuild()
                     val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
                     val raw = runCatching {
@@ -174,7 +174,7 @@ object CtwingKeywordRouter {
                 }
                 "diagnose" -> {
                     kotlinx.coroutines.delay(2_000L)
-                    CtwingFacade.pullToken()
+                    CtwingFacade.pullTokenOrRebuild()
                     val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
                     val raw = runCatching {
@@ -196,7 +196,8 @@ object CtwingKeywordRouter {
                 }
                 "rebind" -> {
                     send("🔄 正在提交重绑…")
-                    CtwingFacade.pullToken()
+                    CtwingFacade.pullTokenOrRebuild()
+                    val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
                     // 卡号类型中文标签：根据用户发来的号码类型回显
                     val idTypeLabel = when (idType) {
@@ -217,15 +218,28 @@ object CtwingKeywordRouter {
                         put("operation", "JKCB")
                     }.toString()
                     XposedBridge.log("$TAG operationCommit: $payload")
-                    // POST 需要浏览器 CSRF 上下文，用 WebView XHR 而非 NativeHttp
-                    CtwingFacade.operationCommit(payload)
 
+                    // 策略：优先 WebView XHR（原生 CSRF），轮询失败则 fallback NativeHttp
+                    CtwingFacade.operationCommit(payload)
                     var raw: String = "null"
-                    for (round in 1..15) {
+                    var webViewOk = false
+                    for (round in 1..6) {
                         kotlinx.coroutines.delay(1_000L)
                         raw = CtwingFacade.pollDshResult()
-                        if (raw.contains("operationCommit-ok") || raw.contains("operationCommit-err")) break
-                        if (raw.length > 20 && raw != "null") break  // got real data
+                        if (raw.contains("operationCommit-ok") || raw.contains("operationCommit-err")) {
+                            webViewOk = true; break
+                        }
+                        if (raw.length > 20 && raw != "null") { webViewOk = true; break }
+                    }
+                    // WebView XHR 回调未触发（双开/X5 后台常见），fallback NativeHttp
+                    if (!webViewOk) {
+                        XposedBridge.log("$TAG rebind: WebView XHR stalled, fallback NativeHttp")
+                        raw = runCatching {
+                            NativeHttp.operationCommit(token, payload)
+                        }.getOrElse { e ->
+                            XposedBridge.log("$TAG rebind NativeHttp failed: ${e.message}")
+                            """{"code":-1,"msg":"${e.message}"}"""
+                        }
                     }
                     CtwingFacade.releaseWakeLock()
 
