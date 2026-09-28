@@ -1,9 +1,21 @@
+import java.util.TimeZone
+import java.text.SimpleDateFormat
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+// 版本号硬性规则：统一用编译时的 Linux 时间戳。
+//   versionCode = Unix 时间戳（秒，天然递增，Int 范围可用到 2038 年）
+//   versionName = "yyyyMMddHHmmss" 可读时间戳（便于排查）
+// 每次编译自动更新，无需手动改版本号。
+val buildUnixTimestamp = System.currentTimeMillis() / 1000L
+val buildTimestampStr = SimpleDateFormat("yyyyMMddHHmmss").apply {
+    timeZone = TimeZone.getTimeZone("Asia/Shanghai")
+}.format(System.currentTimeMillis())
 
 android {
     namespace = "dev.example.autoreply"
@@ -13,8 +25,8 @@ android {
         applicationId = "dev.example.autoreply"
         minSdk = 28
         targetSdk = 35
-        versionCode = 2026092802
-        versionName = "2026.09.28.2"
+        versionCode = buildUnixTimestamp.toInt()
+        versionName = buildTimestampStr
     }
 
     buildTypes {
@@ -31,7 +43,7 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
-buildFeatures {
+    buildFeatures {
         compose = true
     }
 }

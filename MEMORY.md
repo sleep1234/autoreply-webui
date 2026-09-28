@@ -31,6 +31,30 @@
 
 ---
 
+## 硬性规则
+
+### 版本号
+
+**每次编译自动更新，使用编译时的 Linux 时间戳**：
+
+| 字段 | 计算方式 | 示例 |
+|------|----------|------|
+| versionCode | `System.currentTimeMillis() / 1000L`（Unix 秒） | `1790575646` |
+| versionName | `SimpleDateFormat("yyyyMMddHHmmss")`（东八区） | `20260928140726` |
+
+规则写入 `app/build.gradle.kts` 顶部注释，自动执行，无需手动改版本号。versionCode 天然递增，可排序追溯。
+
+### 锁顺序
+
+| 情况 | 说明 |
+|------|------|
+| webViewMutex → rebuildMutex | 有 webViewMutex 的操作可调用 rebuildAndWait（获取 rebuildMutex） |
+| rebuildMutex 单独 | TokenKeepAlive 等外部可单独获取 rebuildMutex |
+
+**禁止反向获取**（持有 rebuildMutex 时获取 webViewMutex），否则死锁。
+
+---
+
 ## 二、核心技术洞察
 
 ### 2.1 进程模型真相
