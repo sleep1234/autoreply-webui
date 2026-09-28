@@ -31,6 +31,9 @@
 | 21 | **命令容错** | startsWith 匹配，要求精确格式 | contains 匹配 + 支持号码/命令词任意位置 + 新增"解绑"别名 |
 | 22 | **重绑缺少幂等保护** | 无防重复机制，手抖/群聊重复推送会建重复工单 | 30s 幂等窗口（ConcurrentHashMap 记录卡号→时间戳） |
 | 23 | **版本号手动维护** | 手写 versionCode/versionName，容易忘改 | 编译时 Unix 时间戳自动生成（`SimpleDateFormat("yyyyMMddHHmmss")`） |
+| 24 | **重绑失败分类错误** | 所有失败都同等对待（清除幂等） | isPermanentBusinessError 区分永久/临时错误；永久保留幂等防刷 |
+| 25 | **401 token 过期无自动刷新** | pullTokenOrRebuild 只在 WebView null 时重建，token 在旧不过期不走重建 | 查询/诊断收到 401 → forceRebuild 走完整 OAuth → 自动重试 |
+| 26 | **查询/诊断无命令空格的容错** | startsWith 要求精确格式 | contains 匹配 + 支持号码/命令词任意位置
 
 ---
 
@@ -209,17 +212,19 @@ rebuildAndWait:
 
 | 功能 | 状态 |
 |------|------|
-| 查询（ICCID/接入号） | ✅ NativeHttp GET |
-| 诊断（ICCID/接入号） | ✅ NativeHttp GET |
-| 重绑（ICCID/接入号/IMSI） | ✅ WebView XHR + NativeHttp fallback |
+| 查询（ICCID/接入号） | ✅ NativeHttp GET，401 自动重建 OAuth 重试 |
+| 诊断（ICCID/接入号） | ✅ NativeHttp GET，401 自动重建 OAuth 重试 |
+| 重绑（ICCID/接入号/IMSI） | ✅ WebView XHR + NativeHttp fallback，30s 幂等防重复 |
 | 群聊 @ 发起者（真实通知） | ✅ AtMentionHook 注入 atuserlist |
-| 群聊引用原文 | ❌ 已移除（用户要求不重复原文） |
 | 重绑回显卡号 | ✅ 结果末尾追加类型标签+号码 |
+| 命令容错 | ✅ contains 匹配 + 号码/命令词任意位置 + "解绑"别名 |
+| 重绑失败分类 | ✅ 永久业务错误保留幂等（不刷），临时/网络错误允许重试 |
 | 白名单 | ✅ 空=不回复，非空=只回复列表内 |
 | 后台静默 | ✅ NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack |
 | WebView 被杀自动恢复 | ✅ pullTokenOrRebuild + fireJs 兜底 + TokenKeepAlive 兜底 |
 | 防并发重建 | ✅ rebuildMutex 互斥锁 |
 | 防窗口堆积 | ✅ finish 多余旧壳，保留一个 |
+| 版本号 | ✅ 编译时 Unix 时间戳自动生成 |
 | 模块元信息 | ✅ 天翼物联一站式服务工具 / 无桌面图标 / 静态 scope |
 
 ### 7.2 正常运行逻辑
@@ -228,22 +233,30 @@ rebuildAndWait:
 1. 模块加载 → 消息捕获引擎 + 白名单 + AtMention 初始化
 2. `preInitH5()`：静默打开 CTWing OAuth（独立任务栈）→ 偷取 WebView 到透明 overlay → moveTaskToBack
 3. `pullToken()` 拉取 ACCESS_TOKEN 缓存
-4. `TokenKeepAlive` 每 25 分钟保活 token
+4. `TokenKeepAlive` 每 25 分钟保活 token（WebView 死亡自动重建）
 
 **消息处理阶段**（收到消息）：
 ```
 消息捕获 → 去重 → 白名单过滤 → 群聊 @ 检测
-  → 关键词路由：
-      查询/诊断：pullTokenOrRebuild → NativeHttp GET → 格式化回复
-      重绑：pullTokenOrRebuild → WebView XHR（fallback NativeHttp）→ 格式化回复
+  → 关键词路由（contains 容错匹配）：
+      查询/诊断：pullTokenOrRebuild → NativeHttp GET
+                → 401 → forceRebuild(OAuth) → 换新 token → 自动重试
+                → 格式化回复
+      重绑：幂等检查（30s 窗口）→ pullTokenOrRebuild
+            → WebView XHR（fallback NativeHttp）
+            → 成功：记录幂等 | 永久错误：保留幂等防刷 | 临时错误：清除允许重试
+            → 格式化回复 + 回显卡号
       其他：统一欢迎帮助信息
   → 群聊回复：@昵称 + 真实 @ 通知
 ```
 
-**异常恢复阶段**（WebView 被杀）：
+**异常恢复阶段**（WebView 被杀 / token 过期）：
 ```
-pullToken 失败 → ensureReady → rebuildAndWait（rebuildMutex 锁）
+WebView 被杀：pullToken 失败 → ensureReady → rebuildAndWait（rebuildMutex 锁）
   → 静默重建 → finish 旧壳 + moveTaskToBack 新壳 → 重拉 token
+
+Token 过期（401）：NativeHttp 返回 code=401 → forceRebuild 走完整 OAuth
+  → pullToken 换新 token → 重试请求（用户无感）
 ```
 
 ### 7.3 双开/多用户支持
