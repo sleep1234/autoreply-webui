@@ -276,6 +276,21 @@ object CtwingKeywordRouter {
                     }
                     CtwingFacade.releaseWakeLock()
 
+                    // 401 token 过期：强制重建 OAuth 换新 token，重新提交一次
+                    if (raw.contains("\"code\":401")) {
+                        XposedBridge.log("$TAG rebind: 401, force rebuild + retry")
+                        recentRebind.remove(iccid)  // 清除幂等，允许重试
+                        CtwingFacade.forceRebuild(40_000L)
+                        CtwingFacade.pullToken()
+                        val newToken = NativeHttp.cachedToken ?: ""
+                        raw = runCatching {
+                            NativeHttp.operationCommit(newToken, payload)
+                        }.getOrElse { e ->
+                            XposedBridge.log("$TAG rebind retry failed: ${e.message}")
+                            """{"code":-1,"msg":"${e.message}"}"""
+                        }
+                    }
+
                     XposedBridge.log("$TAG rebind raw(${raw.length}): ${raw.take(600)}")
                     val resultText = try {
                         var cur: Any = raw.trim()
