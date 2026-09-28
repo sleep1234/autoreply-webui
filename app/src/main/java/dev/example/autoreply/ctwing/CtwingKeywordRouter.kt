@@ -208,7 +208,6 @@ object CtwingKeywordRouter {
                         send("⏳ $iccid 已提交重绑，请勿重复操作（${(REBIND_IDEMPOTENT_WINDOW_MS - (now - lastTs)) / 1000}s 后可重试）")
                         return@withLock
                     }
-                    recentRebind[iccid] = now
                     send("🔄 正在提交重绑…")
                     CtwingFacade.pullTokenOrRebuild()
                     val token = NativeHttp.cachedToken ?: ""
@@ -297,22 +296,32 @@ object CtwingKeywordRouter {
                         val workId = bdata?.optString("id", "") ?: ""
 
                         when {
-                            bcode == 401 ->
+                            bcode == 401 -> {
+                                recentRebind.remove(iccid)  // 失败允许立刻重试
                                 "⚠️ 重绑失败：未登录，token 已过期"
-                            bcode != 0 ->
+                            }
+                            bcode != 0 -> {
+                                recentRebind.remove(iccid)  // 失败允许立刻重试
                                 "❌ 重绑失败：${bj.optString("msg", "code=$bcode")}"
+                            }
                             opStatus.contains("成功") -> {
+                                // 只有明确成功才记录幂等（防重复工单），失败允许立刻重试
+                                recentRebind[iccid] = System.currentTimeMillis()
                                 val sb = StringBuilder("✅ 机卡重绑成功")
                                 if (workId.isNotBlank()) sb.append("（工单：$workId）")
                                 if (remark.isNotBlank()) sb.append("\n$remark")
                                 sb.toString()
                             }
                             opStatus.contains("失败") -> {
+                                // 业务失败：清除幂等记录，允许立刻重试
+                                recentRebind.remove(iccid)
                                 val sb = StringBuilder("❌ 机卡重绑失败")
                                 if (remark.isNotBlank()) sb.append("：$remark")
                                 sb.toString()
                             }
                             else -> {
+                                // 已提交（异步工单，结果未定）：记录幂等防重复
+                                recentRebind[iccid] = System.currentTimeMillis()
                                 val sb = StringBuilder("✅ 机卡重绑已提交")
                                 if (workId.isNotBlank()) sb.append("（工单：$workId）")
                                 sb.append("\n⏳ 处理结果请稍后查询")
@@ -321,8 +330,15 @@ object CtwingKeywordRouter {
                         }
                     } catch (e: Exception) {
                         XposedBridge.log("$TAG rebind parse failed: ${e.message}")
-                        if (raw.contains("\"code\":0")) "✅ 机卡重绑已提交成功"
-                        else "📋 重绑提交结果：\n${raw.take(300)}"
+                        // 解析失败（可能已提交成功但格式异常）：保守起见记录幂等，防重复工单
+                        if (raw.contains("\"code\":0")) {
+                            recentRebind[iccid] = System.currentTimeMillis()
+                            "✅ 机卡重绑已提交成功"
+                        } else {
+                            // 明确失败/超时：清除幂等，允许重试
+                            recentRebind.remove(iccid)
+                            "📋 重绑提交结果：\n${raw.take(300)}"
+                        }
                     }
                     send("$resultText\n$idTypeLabel：$iccid")
                 }
