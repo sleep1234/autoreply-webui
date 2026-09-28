@@ -28,6 +28,9 @@
 | 18 | **重绑 XHR 回调不触发（双开）** | X5 后台 JS 事件循环被挂起，onreadystatechange 不执行 | 6 秒轮询超时后 fallback NativeHttp POST（带 cachedCookie） |
 | 19 | **并发重建导致多窗口叠加** | pullTokenOrRebuild 与 TokenKeepAlive 同时 rebuildAndWait，无锁保护 | rebuildAndWait 加 rebuildMutex 互斥锁 + 二次检查 |
 | 20 | **旧 MMWebViewUI 空壳堆积** | NEW_DOCUMENT 每次建新窗口，旧壳不自动关 | 偷取后 finish 多余旧壳（dropLast(1)），只保留最新一个 moveTaskToBack |
+| 21 | **命令容错** | startsWith 匹配，要求精确格式 | contains 匹配 + 支持号码/命令词任意位置 + 新增"解绑"别名 |
+| 22 | **重绑缺少幂等保护** | 无防重复机制，手抖/群聊重复推送会建重复工单 | 30s 幂等窗口（ConcurrentHashMap 记录卡号→时间戳） |
+| 23 | **版本号手动维护** | 手写 versionCode/versionName，容易忘改 | 编译时 Unix 时间戳自动生成（`SimpleDateFormat("yyyyMMddHHmmss")`） |
 
 ---
 

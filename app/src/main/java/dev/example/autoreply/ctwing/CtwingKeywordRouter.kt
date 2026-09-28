@@ -28,6 +28,10 @@ object CtwingKeywordRouter {
     private val ACCESS_NUM_REGEX = Regex("\\d{8,14}")
     private val IMEI_REGEX = Regex("\\d{15}")
 
+    // 重绑幂等：记录最近重绑的卡号 → 提交时间戳（毫秒），30 秒窗口内不重复提交
+    private val recentRebind = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private const val REBIND_IDEMPOTENT_WINDOW_MS = 30_000L
+
     /**
      * Attempt to handle a message. Returns true if the message matched a
      * CTWing command and a reply was (or will be) sent.
@@ -44,16 +48,18 @@ object CtwingKeywordRouter {
 
         val lower = content.lowercase()
 
+        // 命令容错：用 contains 而非 startsWith，支持「帮我查一下 8986...」「8986... 查询」等
+        // 但保持关键词优先级：重绑 > 诊断 > 查询，避免「查询」误匹配「重绑查询」
         val op = when {
-            lower.startsWith("界面") || lower.startsWith("uidump") || lower.startsWith("ui") -> "uiDump"
-            lower.startsWith("发现") || lower.startsWith("discover") -> "discover"
-            lower.startsWith("取凭证") || lower.startsWith("credential") -> "credential"
-            lower.startsWith("捕获") || lower.startsWith("capture") -> "capture"
-            lower.startsWith("侦察报告") || lower.startsWith("reconreport") -> "reconReport"
-            lower.startsWith("加密侦察") || lower.startsWith("recon") -> "recon"
-            lower.startsWith("重绑") || lower.startsWith("rebind") -> "rebind"
-            lower.startsWith("诊断") || lower.startsWith("diagnose") -> "diagnose"
-            lower.startsWith("查询") || lower.startsWith("查卡") || lower.startsWith("query") -> "query"
+            lower.contains("界面") || lower.contains("uidump") -> "uiDump"
+            lower.contains("发现") || lower.contains("discover") -> "discover"
+            lower.contains("取凭证") || lower.contains("credential") -> "credential"
+            lower.contains("捕获") || lower.contains("capture") -> "capture"
+            lower.contains("侦察报告") || lower.contains("reconreport") -> "reconReport"
+            lower.contains("加密侦察") || lower.contains("recon") -> "recon"
+            lower.contains("重绑") || lower.contains("rebind") || lower.contains("解绑") -> "rebind"
+            lower.contains("诊断") || lower.contains("diagnose") -> "diagnose"
+            lower.contains("查询") || lower.contains("查卡") || lower.contains("query") -> "query"
             else -> return false
         }
 
@@ -195,6 +201,14 @@ object CtwingKeywordRouter {
                     else send("⚠️ 诊断超时：${(raw ?: "null").take(120)}")
                 }
                 "rebind" -> {
+                    // 幂等：30s 内同一卡号不重复提交（重绑是真实业务工单，防手抖/重复触发）
+                    val lastTs = recentRebind[iccid]
+                    val now = System.currentTimeMillis()
+                    if (lastTs != null && (now - lastTs) < REBIND_IDEMPOTENT_WINDOW_MS) {
+                        send("⏳ $iccid 已提交重绑，请勿重复操作（${(REBIND_IDEMPOTENT_WINDOW_MS - (now - lastTs)) / 1000}s 后可重试）")
+                        return@withLock
+                    }
+                    recentRebind[iccid] = now
                     send("🔄 正在提交重绑…")
                     CtwingFacade.pullTokenOrRebuild()
                     val token = NativeHttp.cachedToken ?: ""
