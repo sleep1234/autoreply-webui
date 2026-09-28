@@ -33,7 +33,9 @@
 | 23 | **版本号手动维护** | 手写 versionCode/versionName，容易忘改 | 编译时 Unix 时间戳自动生成（`SimpleDateFormat("yyyyMMddHHmmss")`） |
 | 24 | **重绑失败分类错误** | 所有失败都同等对待（清除幂等） | isPermanentBusinessError 区分永久/临时错误；永久保留幂等防刷 |
 | 25 | **401 token 过期无自动刷新** | pullTokenOrRebuild 只在 WebView null 时重建，token 在旧不过期不走重建 | 查询/诊断收到 401 → forceRebuild 走完整 OAuth → 自动重试 |
-| 26 | **查询/诊断无命令空格的容错** | startsWith 要求精确格式 | contains 匹配 + 支持号码/命令词任意位置
+| 26 | **查询/诊断无命令空格的容错** | startsWith 要求精确格式 | contains 匹配 + 支持号码/命令词任意位置 |
+| 27 | **状态自检只是字符串判空** | 有 token 就报"正常"，实际可能已过期 | basicInfo 真实验证 + 过期自动续期 |
+| 28 | **查询/诊断/重绑 401 重试重复** | 三处各写一遍 forceRebuild 重试 | 提取 nativeGetWithRetry 通用函数（查询/诊断），重绑单独处理 |
 
 ---
 
@@ -219,6 +221,9 @@ rebuildAndWait:
 | 重绑回显卡号 | ✅ 结果末尾追加类型标签+号码 |
 | 命令容错 | ✅ contains 匹配 + 号码/命令词任意位置 + "解绑"别名 |
 | 重绑失败分类 | ✅ 永久业务错误保留幂等（不刷），临时/网络错误允许重试 |
+| 状态自检 | ✅ basicInfo 真实验证 token + 过期自动续期 |
+| 续期命令 | ✅ 调用 TokenKeepAlive 温和续期 |
+| 定时自动续期 | ✅ TokenKeepAlive 每 25 分钟（onResume/重建/basicInfo 三级） |
 | 白名单 | ✅ 空=不回复，非空=只回复列表内 |
 | 后台静默 | ✅ NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack |
 | WebView 被杀自动恢复 | ✅ pullTokenOrRebuild + fireJs 兜底 + TokenKeepAlive 兜底 |
