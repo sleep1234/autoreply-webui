@@ -148,16 +148,54 @@ object CtwingKeywordRouter {
             return true
         }
 
-        // ---- 状态自检：无卡号，报告模块运行状态 ----
+        // ---- 状态自检：用 basicInfo 真实验证 token 是否有效 ----
         if (op == "status") {
             try {
                 val wv = CtwingWebViewHook.currentWebView()
-                val token = NativeHttp.cachedToken
                 val whitelist = WhitelistStore.list()
                 val webViewAlive = wv != null
+
+                // 真实验证 token：用 basicInfo 探活（最轻量接口）
+                val token = NativeHttp.cachedToken
+                val tokenValid = if (token.isNullOrBlank()) {
+                    false
+                } else {
+                    runCatching {
+                        val body = NativeHttp.basicInfo(token, "iccid", "89860620140020723456")
+                        // basicInfo 成功返回 data 对象，而不是 code=401
+                        !body.contains("\"code\":401")
+                    }.getOrDefault(false)
+                }
+
+                // token 过期 → 自动续期
+                if (!tokenValid && NativeHttp.cachedToken != null) {
+                    send("⚠️ 登录态已过期，正在自动续期…")
+                    try {
+                        TokenKeepAlive.doRefresh()
+                        // 续期后再次验证
+                        val newToken = NativeHttp.cachedToken ?: ""
+                        val renewed = runCatching {
+                            val body = NativeHttp.basicInfo(newToken, "iccid", "89860620140020723456")
+                            !body.contains("\"code\":401")
+                        }.getOrDefault(false)
+                        val sb = StringBuilder()
+                        sb.append("✅ 天翼物联一站式服务工具\n")
+                        sb.append("· 后台服务：${if (webViewAlive) "正常" else "异常（WebView 丢失）"}\n")
+                        sb.append("· 登录态：${if (renewed) "正常（刚刚续期成功）" else "续期失败，请稍后重试"}\n")
+                        sb.append("· 白名单：${if (whitelist.isEmpty()) "未启用（不回复任何人）" else "已启用（${whitelist.size} 个会话）"}")
+                        send(sb.toString())
+                        return true
+                    } catch (e2: Exception) {
+                        send("⚠️ 续期失败：${e2.message}")
+                        return true
+                    }
+                }
+
                 val tokenState = when {
-                    token.isNullOrBlank() -> "无 token（需续期）"
-                    else -> "已缓存（${token.length} 字符）"
+                    token.isNullOrBlank() -> "无 token（需发送「续期」）"
+                    tokenValid -> "正常"
+                    !tokenValid -> "已过期（建议发送「续期」）"
+                    else -> "未知"
                 }
                 val sb = StringBuilder()
                 sb.append("✅ 天翼物联一站式服务工具\n")
@@ -197,26 +235,8 @@ object CtwingKeywordRouter {
             when (op) {
                 "query" -> {
                     kotlinx.coroutines.delay(2_000L)
-                    CtwingFacade.pullTokenOrRebuild()
-                    val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
-                    var raw = runCatching {
-                        NativeHttp.queryCard(token, idType, iccid)
-                    }.getOrElse { e ->
-                        XposedBridge.log("$TAG query NativeHttp failed: ${e.message}")
-                        null
-                    }
-                    // 401 token 过期：强制重建 OAuth 换新 token，重试一次
-                    if (raw != null && raw.contains("\"code\":401")) {
-                        XposedBridge.log("$TAG query: 401, force rebuild + retry")
-                        CtwingFacade.forceRebuild(40_000L)
-                        CtwingFacade.pullToken()
-                        val newToken = NativeHttp.cachedToken ?: ""
-                        raw = runCatching {
-                            NativeHttp.queryCard(newToken, idType, iccid)
-                        }.getOrElse { e -> XposedBridge.log("$TAG query retry failed: ${e.message}"); null }
-                    }
-                    CtwingFacade.releaseWakeLock()
+                    val raw = nativeGetWithRetry("query") { token -> NativeHttp.queryCard(token, idType, iccid) }
                     // 先检测业务错误（code!=0, data=null）——如"不在查询范围"
                     val errorMsg = raw?.let { extractQueryError(it) }
                     if (errorMsg != null) {
@@ -230,26 +250,8 @@ object CtwingKeywordRouter {
                 }
                 "diagnose" -> {
                     kotlinx.coroutines.delay(2_000L)
-                    CtwingFacade.pullTokenOrRebuild()
-                    val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
-                    var raw = runCatching {
-                        NativeHttp.diagnose(token, idType, iccid)
-                    }.getOrElse { e ->
-                        XposedBridge.log("$TAG diagnose NativeHttp failed: ${e.message}")
-                        null
-                    }
-                    // 401 token 过期：强制重建 OAuth 换新 token，重试一次
-                    if (raw != null && raw.contains("\"code\":401")) {
-                        XposedBridge.log("$TAG diagnose: 401, force rebuild + retry")
-                        CtwingFacade.forceRebuild(40_000L)
-                        CtwingFacade.pullToken()
-                        val newToken = NativeHttp.cachedToken ?: ""
-                        raw = runCatching {
-                            NativeHttp.diagnose(newToken, idType, iccid)
-                        }.getOrElse { e -> XposedBridge.log("$TAG diagnose retry failed: ${e.message}"); null }
-                    }
-                    CtwingFacade.releaseWakeLock()
+                    val raw = nativeGetWithRetry("diagnose") { token -> NativeHttp.diagnose(token, idType, iccid) }
                     // 先检测业务错误（code!=0）——如 401 未登录
                     val errorMsg = raw?.let { extractQueryError(it) }
                     if (errorMsg != null) {
@@ -440,6 +442,35 @@ object CtwingKeywordRouter {
     // ------------------------------------------------------------------
     //  Formatting (best-effort; JSON structure is version-specific)
     // ------------------------------------------------------------------
+
+    /**
+     * 通用 NativeHttp GET 请求：自动处理 token 拉取 + 401 重建重试。
+     * [request] 是具体请求闭包（queryCard / diagnose），返回 API 原始响应字符串。
+     */
+    private suspend fun nativeGetWithRetry(
+        tag: String,
+        request: (token: String) -> String,
+    ): String? {
+        CtwingFacade.pullTokenOrRebuild()
+        val token = NativeHttp.cachedToken ?: ""
+        var raw = runCatching { request(token) }.getOrElse { e ->
+            XposedBridge.log("$TAG $tag NativeHttp failed: ${e.message}")
+            null
+        }
+        // 401 token 过期：强制重建 OAuth 换新 token，重试一次
+        if (raw != null && raw.contains("\"code\":401")) {
+            XposedBridge.log("$TAG $tag: 401, force rebuild + retry")
+            CtwingFacade.forceRebuild(40_000L)
+            CtwingFacade.pullToken()
+            val newToken = NativeHttp.cachedToken ?: ""
+            raw = runCatching { request(newToken) }.getOrElse { e ->
+                XposedBridge.log("$TAG $tag retry failed: ${e.message}")
+                null
+            }
+        }
+        CtwingFacade.releaseWakeLock()
+        return raw
+    }
 
     /** CTROBF1 ciphertext marker (the API returns this when undecrypted). */
     private fun isCiphertext(s: String): Boolean =
