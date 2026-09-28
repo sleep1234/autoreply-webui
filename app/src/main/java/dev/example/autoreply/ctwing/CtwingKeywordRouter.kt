@@ -2,6 +2,7 @@ package dev.example.autoreply.ctwing
 
 import de.robv.android.xposed.XposedBridge
 import dev.example.autoreply.hook.IncomingMessage
+import dev.example.autoreply.ui.WhitelistStore
 import kotlinx.coroutines.sync.withLock
 
 /**
@@ -60,6 +61,9 @@ object CtwingKeywordRouter {
             lower.contains("重绑") || lower.contains("rebind") || lower.contains("解绑") -> "rebind"
             lower.contains("诊断") || lower.contains("diagnose") -> "diagnose"
             lower.contains("查询") || lower.contains("查卡") || lower.contains("query") -> "query"
+            // 状态自检 + 续期（无卡号，需在 ICCID 检查前处理）
+            lower.contains("续期") || lower.contains("renew") || lower.contains("刷新token") -> "renew"
+            lower.contains("状态") || lower.contains("status") || lower.contains("自检") -> "status"
             else -> return false
         }
 
@@ -144,6 +148,41 @@ object CtwingKeywordRouter {
             return true
         }
 
+        // ---- 状态自检：无卡号，报告模块运行状态 ----
+        if (op == "status") {
+            try {
+                val wv = CtwingWebViewHook.currentWebView()
+                val token = NativeHttp.cachedToken
+                val whitelist = WhitelistStore.list()
+                val webViewAlive = wv != null
+                val tokenState = when {
+                    token.isNullOrBlank() -> "无 token（需续期）"
+                    else -> "已缓存（${token.length} 字符）"
+                }
+                val sb = StringBuilder()
+                sb.append("✅ 天翼物联一站式服务工具\n")
+                sb.append("· 后台服务：${if (webViewAlive) "正常" else "异常（WebView 丢失）"}\n")
+                sb.append("· 登录态：$tokenState\n")
+                sb.append("· 白名单：${if (whitelist.isEmpty()) "未启用（不回复任何人）" else "已启用（${whitelist.size} 个会话）"}")
+                send(sb.toString())
+            } catch (e: Exception) {
+                send("❌ 状态查询失败：${e.message}")
+            }
+            return true
+        }
+
+        // ---- 续期：无卡号，直接调用 TokenKeepAlive 的续期逻辑 ----
+        if (op == "renew") {
+            send("🔄 正在续期登录态…")
+            try {
+                TokenKeepAlive.doRefresh()
+                send("✅ 续期完成")
+            } catch (e: Exception) {
+                send("❌ 续期失败：${e.message}")
+            }
+            return true
+        }
+
         // The query API accepts two identifier types: ICCID (19-20 digits) or
         // access number / 接入号 (8-14 digits). Prefer ICCID when both present.
         val iccid = ICCID_REGEX.find(content)?.value
@@ -181,12 +220,13 @@ object CtwingKeywordRouter {
                     // 先检测业务错误（code!=0, data=null）——如"不在查询范围"
                     val errorMsg = raw?.let { extractQueryError(it) }
                     if (errorMsg != null) {
+                        // 业务错误（永久性）：告知原因即可，不引导重试
                         send("⚠️ 查询失败：$errorMsg")
                         return@withLock
                     }
                     val bestResp = raw?.let { extractBestResponse(it) }
                     if (bestResp != null) send(formatCardInfo(bestResp))
-                    else send("⚠️ 查询未完成：${(raw ?: "null").take(120)}")
+                    else send("⚠️ 查询未完成，请稍后重试或发送「续期」刷新登录态")
                 }
                 "diagnose" -> {
                     kotlinx.coroutines.delay(2_000L)
@@ -218,7 +258,7 @@ object CtwingKeywordRouter {
                     }
                     val bestResp = raw?.let { extractBestResponse(it) }
                     if (bestResp != null) send(formatDiagnosis(bestResp))
-                    else send("⚠️ 诊断超时：${(raw ?: "null").take(120)}")
+                    else send("⚠️ 诊断未完成，请稍后重试或发送「续期」刷新登录态")
                 }
                 "rebind" -> {
                     // 幂等：30s 内同一卡号不重复提交（重绑是真实业务工单，防手抖/重复触发）
@@ -333,7 +373,7 @@ object CtwingKeywordRouter {
                         when {
                             bcode == 401 -> {
                                 recentRebind.remove(iccid)  // 可重试：token 刷新后就能过
-                                "⚠️ 重绑失败：未登录，token 已过期"
+                                "⚠️ 重绑失败：登录已过期\n💡 请发送「续期」刷新后重试"
                             }
                             bcode != 0 -> {
                                 val msg = bj.optString("msg", "code=$bcode")
@@ -343,10 +383,11 @@ object CtwingKeywordRouter {
                                 if (isPermanent) {
                                     // 保留幂等记录：这不是网络抖动，重试也不会变
                                     recentRebind[iccid] = System.currentTimeMillis()
+                                    "❌ 重绑失败：$msg"
                                 } else {
                                     recentRebind.remove(iccid)  // 可重试
+                                    "❌ 重绑失败：$msg\n💡 请稍后重试"
                                 }
-                                "❌ 重绑失败：$msg"
                             }
                             opStatus.contains("成功") -> {
                                 // 只有明确成功才记录幂等（防重复工单），失败允许立刻重试
@@ -381,7 +422,7 @@ object CtwingKeywordRouter {
                         } else {
                             // 明确失败/超时：清除幂等，允许重试
                             recentRebind.remove(iccid)
-                            "📋 重绑提交结果：\n${raw.take(300)}"
+                            "⚠️ 重绑结果异常，请稍后重试"
                         }
                     }
                     send("$resultText\n$idTypeLabel：$iccid")

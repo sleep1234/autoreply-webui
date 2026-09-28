@@ -38,7 +38,7 @@ object TokenKeepAlive {
         job = null
     }
 
-    private suspend fun doRefresh() {
+    internal suspend fun doRefresh() {
         // If WebView is in the pool, use its onResume to trigger OAuth refresh
         // (the stolen WebView lives in a transparent overlay window)
         val wv = WebViewPool.webView
