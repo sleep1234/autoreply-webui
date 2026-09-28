@@ -161,11 +161,21 @@ object CtwingKeywordRouter {
                     CtwingFacade.pullTokenOrRebuild()
                     val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
-                    val raw = runCatching {
+                    var raw = runCatching {
                         NativeHttp.queryCard(token, idType, iccid)
                     }.getOrElse { e ->
                         XposedBridge.log("$TAG query NativeHttp failed: ${e.message}")
                         null
+                    }
+                    // 401 token 过期：强制重建 OAuth 换新 token，重试一次
+                    if (raw != null && raw.contains("\"code\":401")) {
+                        XposedBridge.log("$TAG query: 401, force rebuild + retry")
+                        CtwingFacade.forceRebuild(40_000L)
+                        CtwingFacade.pullToken()
+                        val newToken = NativeHttp.cachedToken ?: ""
+                        raw = runCatching {
+                            NativeHttp.queryCard(newToken, idType, iccid)
+                        }.getOrElse { e -> XposedBridge.log("$TAG query retry failed: ${e.message}"); null }
                     }
                     CtwingFacade.releaseWakeLock()
                     // 先检测业务错误（code!=0, data=null）——如"不在查询范围"
@@ -183,11 +193,21 @@ object CtwingKeywordRouter {
                     CtwingFacade.pullTokenOrRebuild()
                     val token = NativeHttp.cachedToken ?: ""
                     val idType = inferType(iccid)
-                    val raw = runCatching {
+                    var raw = runCatching {
                         NativeHttp.diagnose(token, idType, iccid)
                     }.getOrElse { e ->
                         XposedBridge.log("$TAG diagnose NativeHttp failed: ${e.message}")
                         null
+                    }
+                    // 401 token 过期：强制重建 OAuth 换新 token，重试一次
+                    if (raw != null && raw.contains("\"code\":401")) {
+                        XposedBridge.log("$TAG diagnose: 401, force rebuild + retry")
+                        CtwingFacade.forceRebuild(40_000L)
+                        CtwingFacade.pullToken()
+                        val newToken = NativeHttp.cachedToken ?: ""
+                        raw = runCatching {
+                            NativeHttp.diagnose(newToken, idType, iccid)
+                        }.getOrElse { e -> XposedBridge.log("$TAG diagnose retry failed: ${e.message}"); null }
                     }
                     CtwingFacade.releaseWakeLock()
                     // 先检测业务错误（code!=0）——如 401 未登录
