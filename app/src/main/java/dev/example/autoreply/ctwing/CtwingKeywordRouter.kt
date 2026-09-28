@@ -297,12 +297,21 @@ object CtwingKeywordRouter {
 
                         when {
                             bcode == 401 -> {
-                                recentRebind.remove(iccid)  // 失败允许立刻重试
+                                recentRebind.remove(iccid)  // 可重试：token 刷新后就能过
                                 "⚠️ 重绑失败：未登录，token 已过期"
                             }
                             bcode != 0 -> {
-                                recentRebind.remove(iccid)  // 失败允许立刻重试
-                                "❌ 重绑失败：${bj.optString("msg", "code=$bcode")}"
+                                val msg = bj.optString("msg", "code=$bcode")
+                                // 永久性业务错误（权限、范围、卡归属）→ 保留幂等，重试无用
+                                // 临时性错误（网络、超时）→ 清除幂等，允许重试
+                                val isPermanent = isPermanentBusinessError(msg)
+                                if (isPermanent) {
+                                    // 保留幂等记录：这不是网络抖动，重试也不会变
+                                    recentRebind[iccid] = System.currentTimeMillis()
+                                } else {
+                                    recentRebind.remove(iccid)  // 可重试
+                                }
+                                "❌ 重绑失败：$msg"
                             }
                             opStatus.contains("成功") -> {
                                 // 只有明确成功才记录幂等（防重复工单），失败允许立刻重试
@@ -313,8 +322,8 @@ object CtwingKeywordRouter {
                                 sb.toString()
                             }
                             opStatus.contains("失败") -> {
-                                // 业务失败：清除幂等记录，允许立刻重试
-                                recentRebind.remove(iccid)
+                                // 业务侧明确失败（工单状态=失败），非网络抖动，保留幂等防重复
+                                recentRebind[iccid] = System.currentTimeMillis()
                                 val sb = StringBuilder("❌ 机卡重绑失败")
                                 if (remark.isNotBlank()) sb.append("：$remark")
                                 sb.toString()
@@ -387,6 +396,20 @@ object CtwingKeywordRouter {
                 msg.replace("不在您的查询范围内", "非台州电信开卡")
             } else null
         } catch (_: Exception) { null }
+    }
+
+    /**
+     * 判断重绑错误是否为「永久性业务错误」，即重试也不会改善。
+     * 永久错误 → 保留幂等记录，防止用户无意义重复提交。
+     * 临时错误（网络/超时/401）→ 清除幂等，允许立刻重试。
+     */
+    private fun isPermanentBusinessError(msg: String): Boolean {
+        val lower = msg.lowercase()
+        return lower.contains("不在") || lower.contains("范围") ||
+            lower.contains("非台州") || lower.contains("权限") ||
+            lower.contains("授权") || lower.contains("上限") ||
+            lower.contains("次数") || lower.contains("不属于") ||
+            lower.contains("未在您") || lower.contains("亲，该")
     }
 
     /**
