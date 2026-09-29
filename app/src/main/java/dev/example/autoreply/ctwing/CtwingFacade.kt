@@ -149,6 +149,10 @@ object CtwingFacade {
             if (token.isNotBlank()) {
                 NativeHttp.cachedToken = token
                 XposedBridge.log("$TAG pullToken: token captured (${token.length} chars)")
+            } else {
+                // token 为空：说明 WebView 登录态已失效，清掉旧 token 避免误用
+                NativeHttp.cachedToken = null
+                XposedBridge.log("$TAG pullToken: empty token, cleared cachedToken")
             }
             if (bond.isNotBlank()) {
                 NativeHttp.cachedBond = bond

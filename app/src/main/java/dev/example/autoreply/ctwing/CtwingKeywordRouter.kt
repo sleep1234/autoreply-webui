@@ -452,7 +452,14 @@ object CtwingKeywordRouter {
         request: (token: String) -> String,
     ): String? {
         CtwingFacade.pullTokenOrRebuild()
-        val token = NativeHttp.cachedToken ?: ""
+        var token = NativeHttp.cachedToken ?: ""
+        // token 为空（非 null 但空串）：说明 WebView 登录态已彻底失效，需强制重建
+        if (token.isBlank()) {
+            XposedBridge.log("$TAG $tag: empty token, force rebuild before request")
+            CtwingFacade.forceRebuild(40_000L)
+            CtwingFacade.pullToken()
+            token = NativeHttp.cachedToken ?: ""
+        }
         var raw = runCatching { request(token) }.getOrElse { e ->
             XposedBridge.log("$TAG $tag NativeHttp failed: ${e.message}")
             null

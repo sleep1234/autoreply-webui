@@ -60,6 +60,10 @@ object NativeHttp {
                 requestMethod = "GET"
                 connectTimeout = 15_000
                 readTimeout = 20_000
+                // 禁用自动重定向：token 失效时 CTWing 会 302→登录页→302 死循环，
+                // HttpURLConnection 默认跟 20 次后抛 "Too many follow-up requests"。
+                // 手动处理：遇到 302/303/307/308 返回空，由上层决定下一步。
+                instanceFollowRedirects = false
                 for ((k, v) in COMMON_HEADERS) setRequestProperty(k, v)
                 setRequestProperty("Authorization", "Bearer $token")
                 cachedCookie?.let { setRequestProperty("Cookie", it) }
@@ -67,6 +71,16 @@ object NativeHttp {
                 setRequestProperty("Referer", "https://tywlonestop.ctwing.cn:8081/web-apps/")
             }
             val code = conn.responseCode
+            // 重定向/未授权：不读 body 直接返回 code 信息
+            if (code == 401) {
+                XposedBridge.log("$TAG GET $urlStr → 401 (token expired)")
+                return """{"code":401,"msg":"token expired"}"""
+            }
+            if (code in 300..399) {
+                val location = conn.getHeaderField("Location") ?: "(none)"
+                XposedBridge.log("$TAG GET $urlStr → $code redirect → $location")
+                return """{"code":$code,"msg":"redirect to $location"}"""
+            }
             val body = conn.inputStream.bufferedReader().readText()
             XposedBridge.log("$TAG GET $urlStr → $code (${body.length}B) head: ${body.take(300)}")
             return body
@@ -87,6 +101,8 @@ object NativeHttp {
                 doOutput = true
                 connectTimeout = 15_000
                 readTimeout = 20_000
+                // 同 httpGet：禁用自动重定向，避免 token 失效时的 302 死循环
+                instanceFollowRedirects = false
                 for ((k, v) in COMMON_HEADERS) setRequestProperty(k, v)
                 setRequestProperty("Authorization", "Bearer $token")
                 setRequestProperty("Content-Type", "application/json;charset=UTF-8")
@@ -96,6 +112,15 @@ object NativeHttp {
             }
             OutputStreamWriter(conn.outputStream).use { it.write(bodyJson) }
             val code = conn.responseCode
+            if (code == 401) {
+                XposedBridge.log("$TAG POST $urlStr → 401 (token expired)")
+                return """{"code":401,"msg":"token expired"}"""
+            }
+            if (code in 300..399) {
+                val location = conn.getHeaderField("Location") ?: "(none)"
+                XposedBridge.log("$TAG POST $urlStr → $code redirect → $location")
+                return """{"code":$code,"msg":"redirect to $location"}"""
+            }
             val body = try {
                 conn.inputStream.bufferedReader().readText()
             } catch (e: Exception) {
