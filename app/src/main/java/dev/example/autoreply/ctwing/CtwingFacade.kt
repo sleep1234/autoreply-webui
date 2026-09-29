@@ -260,6 +260,18 @@ object CtwingFacade {
 
     suspend fun forceRebuild(timeoutMs: Long = 30_000L): Boolean {
         XposedBridge.log("$TAG force rebuild (token expired)")
+        // 关键：不能直接 rebuildAndWait —— 它的二次检查会发现 WebView 还活着
+        // （在 web-apps/ 页面上）就直接返回，导致 pullToken 读到同一个旧 token。
+        // 强制刷新必须对现有 WebView 重新 loadUrl OAuth，让它重走免密登录换新 token。
+        val wv = WebViewPool.webView ?: CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn")
+        if (wv != null) {
+            XposedBridge.log("$TAG forceRebuild: reload OAuth on existing WebView")
+            reloadOAuthOnPool()
+            // 等待 OAuth → SPA → 新 token 写入（约 10s）
+            kotlinx.coroutines.delay(8_000L)
+            return true
+        }
+        // WebView 彻底没了才走完整重建
         return rebuildAndWait(timeoutMs)
     }
 

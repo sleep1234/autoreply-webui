@@ -21,6 +21,7 @@ object PopupMenuHook {
     @Volatile private var itemDataCtor: Constructor<*>? = null
     @Volatile private var handleClickDeclaringClass: Class<*>? = null
     @Volatile private var menuItemId = 0x7F000001
+    @Volatile private var statusMenuItemId = 0x7F000002
     @Volatile private var installed = false
 
     fun init(classLoader: ClassLoader) {
@@ -160,6 +161,10 @@ object PopupMenuHook {
                 menuItemId, "自动回复白名单", "", android.R.drawable.ic_menu_manage, 0
             ) ?: run { XposedBridge.log("$TAG itemDataCtor 失败"); return }
 
+            val statusItemData = itemDataCtor?.newInstance(
+                statusMenuItemId, "服务状态", "", android.R.drawable.ic_menu_info_details, 0
+            ) ?: run { XposedBridge.log("$TAG statusItemDataCtor 失败"); return }
+
             // 把 itemData 包装成 wrapper 类型（SparseArray 存的是 wrapper，不是 data）
             val wrapper: Any = if (wrapperClass != null && wrapperClass != itemData.javaClass) {
                 val ctor = wrapperClass.declaredConstructors.firstOrNull { it.parameterTypes.size == 1 }
@@ -167,8 +172,16 @@ object PopupMenuHook {
                 ctor?.newInstance(itemData) ?: itemData
             } else itemData
 
+            val statusWrapper: Any = if (wrapperClass != null && wrapperClass != statusItemData.javaClass) {
+                val ctor = wrapperClass.declaredConstructors.firstOrNull { it.parameterTypes.size == 1 }
+                    ?.apply { isAccessible = true }
+                ctor?.newInstance(statusItemData) ?: statusItemData
+            } else statusItemData
+
             @Suppress("UNCHECKED_CAST")
             (items as SparseArray<Any>).put(items.size(), wrapper)
+            @Suppress("UNCHECKED_CAST")
+            (items as SparseArray<Any>).put(items.size(), statusWrapper)
             adapter?.notifyDataSetChanged()
             XposedBridge.log("$TAG 菜单项已注入 (wrapper=${wrapper.javaClass.name}, total=${items.size()})")
         } catch (e: Exception) {
@@ -203,6 +216,14 @@ object PopupMenuHook {
                 }
                 XposedBridge.log("$TAG 点击了白名单菜单")
             }
+            if (id == statusMenuItemId) {
+                param.result = null
+                val activity = getCurrentActivity() ?: return
+                activity.runOnUiThread {
+                    StatusLauncher.showStatusPanel(activity)
+                }
+                XposedBridge.log("$TAG 点击了服务状态菜单")
+            }
         } catch (e: Exception) {
             XposedBridge.log("$TAG interceptClick 失败: ${e.message}")
         }
@@ -213,13 +234,13 @@ object PopupMenuHook {
             f.isAccessible = true
             if (f.type == Int::class.java || f.type == Int::class.javaPrimitiveType) {
                 val v = f.get(obj)
-                if (v is Int && v == menuItemId) return v
+                if (v is Int && (v == menuItemId || v == statusMenuItemId)) return v
             }
             // 递归一层（wrapper -> data）
             if (!f.type.isPrimitive && !f.type.name.startsWith("java.")) {
                 val inner = runCatching { f.get(obj) }.getOrNull() ?: continue
                 val id = extractId(inner)
-                if (id == menuItemId) return id
+                if (id == menuItemId || id == statusMenuItemId) return id
             }
         }
         return -1
