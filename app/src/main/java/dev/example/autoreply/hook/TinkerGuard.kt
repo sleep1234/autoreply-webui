@@ -31,6 +31,31 @@ object TinkerGuard {
     @Volatile
     private var wechatDataDir: String? = null
 
+    // ---- 拦截留痕（供状态面板展示）----
+    private data class Interception(val ts: Long, val layer: String, val detail: String)
+
+    @Volatile
+    private var interceptions: List<Interception> = emptyList()
+
+    /** 记录一次成功拦截（Layer 1 wipe / Layer 2 filter / Layer 3 hook）。 */
+    private fun record(layer: String, detail: String) {
+        val item = Interception(System.currentTimeMillis(), layer, detail)
+        interceptions = (interceptions + item).takeLast(50)  // 最多保留 50 条
+    }
+
+    /** 面板用摘要：拦截总数 + 最近几条。 */
+    fun statusSummary(): String {
+        val list = interceptions
+        if (list.isEmpty()) return "未拦截（无热更新补丁被加载）"
+        val sb = StringBuilder("共拦截 ${list.size} 次")
+        list.takeLast(5).forEach {
+            val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date(it.ts))
+            sb.append("\n· [$t] ${it.layer} ${it.detail.take(60)}")
+        }
+        return sb.toString()
+    }
+
     // ----------------------------------------------------------------
     //  Layer 1: Filesystem wipe
     //  Must run BEFORE Tinker loads the patches (in handleLoadPackage,
@@ -53,6 +78,7 @@ object TinkerGuard {
             if (d.exists()) {
                 val deleted = d.deleteRecursively()
                 log("wipe $name: deleted=$deleted (path=${d.absolutePath})")
+                if (deleted) record("Layer1-wipe", name)
             } else {
                 log("wipe $name: not found")
             }
@@ -118,6 +144,7 @@ object TinkerGuard {
                                 path.contains("hotfix")) {
                                 iter.remove()
                                 log("ClassLoader filter BLOCKED: ${path.takeLast(80)}")
+                                record("Layer2-filter", path.takeLast(60))
                             }
                         }
                     }
@@ -147,6 +174,7 @@ object TinkerGuard {
                         // Return a "failed to load" result
                         param.result = android.content.Intent()
                         log("Layer 3a: TinkerLoader.tryLoad → blocked")
+                        record("Layer3a-TinkerLoader", "tryLoad blocked")
                     }
                 })
             log("Layer 3a (TinkerLoader.tryLoad) installed")
@@ -161,6 +189,7 @@ object TinkerGuard {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         log("Layer 3b: TinkerApplicationLike.onBaseContextAttached → skipping")
+                        record("Layer3b-AppLike", "onBaseContextAttached blocked")
                         // Early-return so the patch install never runs
                         param.result = null
                     }
@@ -187,6 +216,7 @@ object TinkerGuard {
                             object : XC_MethodHook() {
                                 override fun beforeHookedMethod(param: MethodHookParam) {
                                     log("Layer 3c: $cls.${m.name} → blocked")
+                                    record("Layer3c-MM", "$cls.${m.name}")
                                     // Return false/0 for boolean/int return types
                                     param.result = when (m.returnType) {
                                         Boolean::class.javaPrimitiveType -> false
@@ -217,6 +247,7 @@ object TinkerGuard {
                             // Replace with empty placeholder so nothing loads
                             param.args[0] = ""
                             log("Layer 3d: DexClassLoader path BLOCKED: ${path.takeLast(60)}")
+                            record("Layer3d-DexClassLoader", path.takeLast(50))
                         }
                     }
                 }

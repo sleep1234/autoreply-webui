@@ -11,6 +11,7 @@ import androidx.compose.ui.unit.sp
 import dev.example.autoreply.ctwing.CtwingFacade
 import dev.example.autoreply.ctwing.CtwingWebViewHook
 import dev.example.autoreply.ctwing.NativeHttp
+import dev.example.autoreply.hook.TinkerGuard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -28,6 +29,7 @@ fun StatusScreen(
     var tokenValid by remember { mutableStateOf<Boolean?>(null) }
     var whitelistCount by remember { mutableStateOf(0) }
     var whitelistEmpty by remember { mutableStateOf(true) }
+    var tinkerSummary by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
     var renewing by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
@@ -46,6 +48,7 @@ fun StatusScreen(
                     val whitelist = WhitelistStore.list()
                     whitelistCount = whitelist.size
                     whitelistEmpty = whitelist.isEmpty()
+                    tinkerSummary = TinkerGuard.statusSummary()
                     // 真实验证
                     tokenValid = if (token.isNullOrBlank()) {
                         false
@@ -106,6 +109,28 @@ fun StatusScreen(
                     Spacer(Modifier.height(8.dp))
                     val wlState = if (whitelistEmpty) "未启用（不回复任何人）" else "已启用（${whitelistCount} 个会话）"
                     StatusRow("白名单", wlState)
+                }
+            }
+
+            // 热更新拦截（TinkerGuard）
+            if (tinkerSummary.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                    ),
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("🛡️ 热更新拦截", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            tinkerSummary,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            lineHeight = 15.sp,
+                        )
+                    }
                 }
             }
 
