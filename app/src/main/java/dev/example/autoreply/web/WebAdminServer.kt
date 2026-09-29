@@ -130,33 +130,42 @@ object WebAdminServer {
     private suspend fun query(p: Map<String, String>): Triple<Int, String, String> {
         val iccid = p["iccid"] ?: return err("请提供卡号")
         return try {
-            val idType = CtwingKeywordRouter.inferType(iccid)
-            val raw = CtwingKeywordRouter.nativeGetWithRetry("web-query") { NativeHttp.queryCard(it, idType, iccid) }
-            val em = raw?.let { CtwingKeywordRouter.extractQueryError(it) }
-            if (em != null) return err("查询失败：$em")
-            val best = raw?.let { CtwingKeywordRouter.extractBestResponse(it) }
-            val r = best?.let { CtwingKeywordRouter.formatCardInfo(it) } ?: "查询未完成，请稍后重试"
-            ok(r)
+            // 统一队列：与聊天端共用同一把 webViewMutex
+            val result = CtwingFacade.webViewMutex.withLock {
+                val idType = CtwingKeywordRouter.inferType(iccid)
+                val raw = CtwingKeywordRouter.nativeGetWithRetry("web-query") { NativeHttp.queryCard(it, idType, iccid) }
+                val em = raw?.let { CtwingKeywordRouter.extractQueryError(it) }
+                if (em != null) "⚠️ 查询失败：$em"
+                else {
+                    val best = raw?.let { CtwingKeywordRouter.extractBestResponse(it) }
+                    best?.let { CtwingKeywordRouter.formatCardInfo(it) } ?: "⚠️ 查询未完成，请稍后重试或发送「续期」刷新登录态"
+                }
+            }
+            ok(result)
         } catch (e: Exception) { err("查询失败: ${e.message}") }
     }
 
     private suspend fun diagnose(p: Map<String, String>): Triple<Int, String, String> {
         val iccid = p["iccid"] ?: return err("请提供卡号")
         return try {
-            val idType = CtwingKeywordRouter.inferType(iccid)
-            val raw = CtwingKeywordRouter.nativeGetWithRetry("web-diagnose") { NativeHttp.diagnose(it, idType, iccid) }
-            val em = raw?.let { CtwingKeywordRouter.extractQueryError(it) }
-            if (em != null) return err("诊断失败：$em")
-            val best = raw?.let { CtwingKeywordRouter.extractBestResponse(it) }
-            val r = best?.let { CtwingKeywordRouter.formatDiagnosis(it) } ?: "诊断未完成，请稍后重试"
-            ok(r)
+            val result = CtwingFacade.webViewMutex.withLock {
+                val idType = CtwingKeywordRouter.inferType(iccid)
+                val raw = CtwingKeywordRouter.nativeGetWithRetry("web-diagnose") { NativeHttp.diagnose(it, idType, iccid) }
+                val em = raw?.let { CtwingKeywordRouter.extractQueryError(it) }
+                if (em != null) "⚠️ 诊断失败：$em"
+                else {
+                    val best = raw?.let { CtwingKeywordRouter.extractBestResponse(it) }
+                    best?.let { CtwingKeywordRouter.formatDiagnosis(it) } ?: "⚠️ 诊断未完成，请稍后重试或发送「续期」刷新登录态"
+                }
+            }
+            ok(result)
         } catch (e: Exception) { err("诊断失败: ${e.message}") }
     }
 
     private suspend fun rebind(p: Map<String, String>): Triple<Int, String, String> {
         val iccid = p["iccid"] ?: return err("请提供卡号")
         return try {
-            // 直接复用窗口已测通的重绑逻辑
+            // 直接复用窗口已测通的重绑逻辑（executeRebind 内部含 webViewMutex 场景，此处再包一层统一入队）
             val result = CtwingFacade.webViewMutex.withLock {
                 CtwingKeywordRouter.executeRebind(iccid)
             }
@@ -167,10 +176,12 @@ object WebAdminServer {
     private suspend fun renew(): Triple<Int, String, String> {
         return try {
             val old = NativeHttp.cachedToken ?: ""
-            // 和 WeChat 窗口"续期"命令完全一致：forceRebuild + pullToken
-            CtwingFacade.forceRebuild(40_000L)
-            CtwingFacade.pullToken()
-            val nt = NativeHttp.cachedToken ?: ""
+            // 和 WeChat 窗口"续期"命令完全一致，共用同一把锁
+            val nt = CtwingFacade.webViewMutex.withLock {
+                CtwingFacade.forceRebuild(40_000L)
+                CtwingFacade.pullToken()
+                NativeHttp.cachedToken ?: ""
+            }
             val json = org.json.JSONObject().apply {
                 put("ok", true)
                 put("oldToken", old)
@@ -181,26 +192,6 @@ object WebAdminServer {
         } catch (e: Exception) {
             err("续期失败: ${e.message}")
         }
-    }
-
-    private fun parseRebindResult(raw: String, iccid: String, idType: String): String {
-        val label = when (idType) { "msisdn" -> "接入号"; "imsi" -> "IMSI"; else -> "ICCID" }
-        return try {
-            var c: Any = raw.trim(); var g = 0
-            while (c is String && g < 6) { val t = c.trim(); if (!(t.startsWith("\"") || t.startsWith("{"))) break; c = org.json.JSONTokener(t).nextValue(); g++ }
-            val w = c as? org.json.JSONObject ?: throw RuntimeException()
-            val bj = when { w.has("status") && w.has("body") -> when (val bt = w.opt("body")) { is org.json.JSONObject -> bt; is String -> org.json.JSONObject(org.json.JSONTokener(bt).nextValue() as String); else -> null }; else -> w } ?: throw RuntimeException()
-            val bc = bj.optInt("code", -1); val bd = bj.optJSONObject("data")
-            val st = bd?.optString("status", "") ?: ""; val rm = bd?.optString("remark", "") ?: ""; val wid = bd?.optString("id", "") ?: ""
-            val r = when {
-                bc == 401 -> "⚠️ 重绑失败：登录已过期\n💡 请发送「续期」刷新后重试"
-                bc != 0 -> "❌ 重绑失败：${bj.optString("msg", "code=$bc")}"
-                st.contains("成功") -> buildString { append("✅ 机卡重绑成功"); if (wid.isNotBlank()) append("（工单：$wid）"); if (rm.isNotBlank()) append("\n$rm") }
-                st.contains("失败") -> buildString { append("❌ 机卡重绑失败"); if (rm.isNotBlank()) append("：$rm") }
-                else -> buildString { append("✅ 机卡重绑已提交"); if (wid.isNotBlank()) append("（工单：$wid）"); append("\n⏳ 处理结果请稍后查询") }
-            }
-            "$r\n$label：$iccid"
-        } catch (_: Exception) { if (raw.contains("\"code\":0")) "✅ 机卡重绑已提交成功\n$label：$iccid" else "⚠️ 重绑结果异常，请稍后重试\n$label：$iccid" }
     }
 
     // ---- 工具 ----

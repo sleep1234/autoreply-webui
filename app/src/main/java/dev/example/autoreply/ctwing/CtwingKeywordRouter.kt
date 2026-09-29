@@ -220,8 +220,10 @@ object CtwingKeywordRouter {
             val oldToken = NativeHttp.cachedToken
             send("🔄 正在续期（强制刷新）…")
             try {
-                CtwingFacade.forceRebuild(40_000L)
-                CtwingFacade.pullToken()
+                CtwingFacade.webViewMutex.withLock {
+                    CtwingFacade.forceRebuild(40_000L)
+                    CtwingFacade.pullToken()
+                }
                 val newToken = NativeHttp.cachedToken
                 val sb = StringBuilder()
                 sb.append("✅ 续期完成\n")
@@ -251,7 +253,6 @@ object CtwingKeywordRouter {
             CtwingFacade.webViewMutex.withLock {
             when (op) {
                 "query" -> {
-                    kotlinx.coroutines.delay(2_000L)
                     val idType = inferType(iccid)
                     val raw = nativeGetWithRetry("query") { token -> NativeHttp.queryCard(token, idType, iccid) }
                     // 先检测业务错误（code!=0, data=null）——如"不在查询范围"
@@ -266,7 +267,6 @@ object CtwingKeywordRouter {
                     else send("⚠️ 查询未完成，请稍后重试或发送「续期」刷新登录态")
                 }
                 "diagnose" -> {
-                    kotlinx.coroutines.delay(2_000L)
                     val idType = inferType(iccid)
                     val raw = nativeGetWithRetry("diagnose") { token -> NativeHttp.diagnose(token, idType, iccid) }
                     // 先检测业务错误（code!=0）——如 401 未登录

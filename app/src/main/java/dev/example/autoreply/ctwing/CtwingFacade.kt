@@ -241,10 +241,17 @@ object CtwingFacade {
 
     suspend fun forceRebuild(timeoutMs: Long = 30_000L): Boolean {
         XposedBridge.log("$TAG force rebuild (token expired)")
-        // 直接走完整重建（开新 MMWebViewUI），不走 reloadOAuthOnPool。
-        // reloadOAuthOnPool 的 silent loadUrl 在 X5 后台环境下 JS 不执行，
-        // 导致 fireJs(operationCommit) 无效 → 重绑 403/失败。
-        return rebuildAndWait(timeoutMs, force = true)
+        // 续期：不杀 H5，只在已有 WebView 上 reload OAuth URL 换新 token。
+        // 重绑 401 重试用的是 NativeHttp POST（不依赖 WebView XHR），
+        // 只需要新鲜 token，不需要新鲜 H5。
+        val wv = CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn")
+        if (wv != null) {
+            XposedBridge.log("$TAG forceRebuild: reload OAuth on existing WebView")
+            reloadOAuthOnPool(wv)
+            kotlinx.coroutines.delay(8_000L)
+            return true
+        }
+        return rebuildAndWait(timeoutMs)
     }
 
     /**
@@ -308,10 +315,10 @@ object CtwingFacade {
         }
     }
 
-    private suspend fun rebuildAndWait(timeoutMs: Long, force: Boolean = false): Boolean {
+    private suspend fun rebuildAndWait(timeoutMs: Long): Boolean {
         return rebuildMutex.withLock {
-            // 二次检查：等锁期间可能已被其他协程修好（force 模式跳过，强制重建）
-            if (!force && CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn") != null) {
+            // 二次检查：等锁期间可能已被其他协程修好
+            if (CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn") != null) {
                 XposedBridge.log("$TAG rebuild: already ready (fixed while waiting lock)")
                 return@withLock true
             }
