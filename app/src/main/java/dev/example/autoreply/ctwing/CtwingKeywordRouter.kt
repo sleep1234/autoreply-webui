@@ -167,13 +167,13 @@ object CtwingKeywordRouter {
                     }.getOrDefault(false)
                 }
 
-                // token 过期 → 自动续期
+                // token 过期 → 强制重建换新 token
                 if (!tokenValid && NativeHttp.cachedToken != null) {
-                    send("⚠️ 登录态已过期，正在自动续期…")
+                    send("⚠️ 登录态已过期，强制重建中…")
                     try {
                         val oldToken = NativeHttp.cachedToken ?: ""
-                        TokenKeepAlive.doRefresh()
-                        // 续期后再次验证 + 取新 token
+                        CtwingFacade.forceRebuild(40_000L)
+                        CtwingFacade.pullToken()
                         val newToken = NativeHttp.cachedToken ?: ""
                         val renewed = runCatching {
                             val body = NativeHttp.basicInfo(newToken, "iccid", "89860620140020723456")
@@ -182,12 +182,9 @@ object CtwingKeywordRouter {
                         val sb = StringBuilder()
                         sb.append("✅ 天翼物联一站式服务工具\n")
                         sb.append("· 后台服务：${if (webViewAlive) "正常" else "异常（WebView 丢失）"}\n")
-                        sb.append("· 登录态：${if (renewed) "正常（刚刚续期成功）" else "续期失败，请稍后重试"}\n")
-                        if (oldToken != newToken) {
-                            sb.append("· token：${oldToken.take(8)}… → ${newToken.take(8)}…（已刷新）\n")
-                        } else {
-                            sb.append("· token：${newToken.take(8)}…（未变化）\n")
-                        }
+                        sb.append("· 登录态：${if (renewed) "正常（已重建）" else "重建失败"}\n")
+                        sb.append("· 旧 token：$oldToken\n")
+                        sb.append("· 新 token：$newToken\n")
                         sb.append("· 白名单：${if (whitelist.isEmpty()) "未启用（不回复任何人）" else "已启用（${whitelist.size} 个会话）"}")
                         send(sb.toString())
                         return true
@@ -216,12 +213,13 @@ object CtwingKeywordRouter {
             return true
         }
 
-        // ---- 续期：无卡号，直接调用 TokenKeepAlive 的续期逻辑 ----
+        // ---- 续期：强制重建 OAuth 换全新 token（不是温和续期） ----
         if (op == "renew") {
             val oldToken = NativeHttp.cachedToken
-            send("🔄 正在续期登录态…")
+            send("🔄 正在续期（强制刷新）…")
             try {
-                TokenKeepAlive.doRefresh()
+                CtwingFacade.forceRebuild(40_000L)
+                CtwingFacade.pullToken()
                 val newToken = NativeHttp.cachedToken
                 val sb = StringBuilder()
                 sb.append("✅ 续期完成\n")
@@ -229,7 +227,7 @@ object CtwingKeywordRouter {
                 if (oldToken != null && newToken != null && oldToken != newToken) {
                     sb.append("\n· 变化：${oldToken.take(8)}… → ${newToken.take(8)}…（已刷新）")
                 } else if (oldToken == newToken) {
-                    sb.append("（未变化）")
+                    sb.append("\n⚠️ token 未变化，建议稍后重试")
                 }
                 send(sb.toString())
             } catch (e: Exception) {
