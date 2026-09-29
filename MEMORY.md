@@ -43,6 +43,13 @@
 | 33 | **续期/状态不回显 token** | 只显示"成功"/"正常"，无法验证 token 真的变了 | 回显完整 token + 新旧对比 |
 | 34 | **无热更新拦截可观测性** | TinkerGuard 只打 log，面板看不到 | 拦截留痕记录 + 状态面板展示 |
 | 35 | **缺服务状态面板** | 状态只能靠聊天命令查看 | 微信"+"菜单新增「服务状态」入口，含真实验证+一键续期+热更新拦截卡片 |
+| 36 | **网页端自造重绑逻辑 403** | WebAdmin 复制了一份重绑，与窗口行为不一致 | 提取 executeRebind 共用函数，网页/窗口都调它 |
+| 37 | **网页端 NativeHttp 跑主线程** | Web 处理器包了 withContext(Main)，网络请求触发 NetworkOnMainThread | 网络请求走 IO，仅 loadUrl 切主线程 |
+| 38 | **网页端续期多 42s 轮询** | 自加 repeat(12){delay(3500)} 等待 token 变化 | 删掉轮询，与窗口一致：forceRebuild + pullToken 直接返回 |
+| 39 | **网页端查询/诊断缺统一锁** | 未用 webViewMutex，可能和窗口并发操作 WebView | 四操作全部共用 webViewMutex（网页/窗口统一队列） |
+| 40 | **网页端 forceRebuild 杀 H5** | 误改成 rebuildAndWait(force=true) 完整重建 | 恢复 reloadOAuthOnPool（对现有 WebView 重走 OAuth，不杀 H5） |
+| 41 | **网页响应 Content-Length 错乱** | toByteArray() 用系统 charset(GBK) vs BufferedWriter UTF-8 | 统一 UTF-8 + raw OutputStream.write(byte[]) + shutdownOutput |
+| 42 | **网页 ERR_CONNECTION_ABORTED** | BufferedWriter + socket.close() 先发 RST | raw OutputStream + shutdownOutput(FIN) + 200ms 延迟 close |
 
 ---
 
@@ -150,6 +157,27 @@ JEP：**所有需要登录态的 NativeHttp GET 请求，必须先确保 token �
 `HttpURLConnection` 默认 `instanceFollowRedirects=true`，最多跟 20 次。
 token 为空时 CTWing 返回 302 → 登录页 → 302 … 死循环 21 次后抛 `Too many follow-up requests: 21`。
 修复：`instanceFollowRedirects=false`，手动判断 401/3xx 返回结构化错误。
+
+### 2.13 网页端与窗口端必须共用同一套业务函数
+
+WebAdmin 是纯 HTTP 壳，**不得**复制任何 CTWing 业务逻辑。原则：
+
+| 操作 | 唯一实现 | 网页/窗口 |
+|------|---------|-----------|
+| 查询 | `nativeGetWithRetry` + `extractQueryError` + `extractBestResponse` + `formatCardInfo` | 都调这一套 |
+| 诊断 | `nativeGetWithRetry` + `extractQueryError` + `extractBestResponse` + `formatDiagnosis` | 都调这一套 |
+| 重绑 | `executeRebind(iccid)` | 都调这一个 |
+| 续期 | `forceRebuild` + `pullToken` | 都调这一套 |
+
+WebAdmin 只保留 HTTP 基础设施（parseQuery/err/ok/sha256/auth/login/handle/route）。
+**统一队列**：`webViewMutex` 是网页端+窗口端共用的全局互斥锁，四操作全部 `withLock` 串行。
+
+### 2.14 网络请求线程模型
+
+- **NativeHttp（HttpURLConnection）绝对不能在主线程**：Android 抛 NetworkOnMainThreadException（表现 `FAILED: null`）。
+- **WebView 的 loadUrl/evaluateJavascript 必须在主线程**。
+- 原则：网络请求跑 IO 线程；只有 `reloadOAuthOnPool` 里的 `loadUrl` 用 `withContext(Dispatchers.Main)` 包裹。
+- `fireJs` → `evaluateJs` 内部已处理线程（`evaluateJsOnUI` 主线程 post），调用方不用管。
 
 ### 2.10 白名单存储路径跨包权限
 
@@ -261,11 +289,13 @@ rebuildAndWait:
 | 定时自动续期 | ✅ TokenKeepAlive 每 25 分钟（onResume/重建/basicInfo 三级） |
 | **服务状态面板** | ✅ 微信"+"菜单入口：真实验证 + token 展示 + 一键续期 + 热更新拦截卡片 |
 | 热更新拦截 | ✅ TinkerGuard 三层 + 拦截留痕可观测 |
+| **Web 管理后台** | ✅ 端口 60080，内置 HTTP Server（零依赖 ServerSocket + 密码登录 + 5min session） |
 | 白名单 | ✅ 空=不回复，非空=只回复列表内 |
 | 后台静默 | ✅ NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack |
 | WebView 被杀自动恢复 | ✅ pullTokenOrRebuild + fireJs 兜底 + TokenKeepAlive 兜底 |
 | 防并发重建 | ✅ rebuildMutex 互斥锁 |
 | 防窗口堆积 | ✅ finish 多余旧壳，保留一个 |
+| 统一队列 | ✅ webViewMutex 网页端+窗口端全局互斥，四操作串行入队 |
 | 版本号 | ✅ 编译时 Unix 时间戳自动生成 |
 | 模块元信息 | ✅ 天翼物联一站式服务工具 / 无桌面图标 / 静态 scope |
 
@@ -281,15 +311,20 @@ rebuildAndWait:
 ```
 消息捕获 → 去重 → 白名单过滤 → 群聊 @ 检测
   → 关键词路由（contains 容错匹配）：
-      查询/诊断：pullTokenOrRebuild → NativeHttp GET
-                → 401 → forceRebuild(OAuth) → 换新 token → 自动重试
-                → 格式化回复
-      重绑：幂等检查（30s 窗口）→ pullTokenOrRebuild
-            → WebView XHR（fallback NativeHttp）
-            → 成功：记录幂等 | 永久错误：保留幂等防刷 | 临时错误：清除允许重试
-            → 格式化回复 + 回显卡号
+      查询/诊断/续期/重绑：webViewMutex.withLock（统一队列）
+                → 查询/诊断：nativeGetWithRetry → 401 → forceRebuild → 重试 → 格式化
+                → 重绑：executeRebind（幂等→XHR→fallback NativeHttp→解析）
+                → 续期：forceRebuild + pullToken + 新旧对比
       其他：统一欢迎帮助信息
   → 群聊回复：@昵称 + 真实 @ 通知
+```
+
+**Web 管理后台**（浏览器访问 `http://<设备IP>:60080/`）：
+```
+登录（默认密码 admin123，SHA-256 存 web_password.hash）
+  → /api/query  /api/diagnose  /api/rebind  /api/renew
+  → 全部复用窗口端同一套业务函数（webViewMutex 统一队列）
+  → 返回 JSON {ok, result/msg}
 ```
 
 **异常恢复阶段**（WebView 被杀 / token 过期）：
