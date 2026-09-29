@@ -15,6 +15,7 @@ import dev.example.autoreply.ctwing.CtwingWebViewHook
 import dev.example.autoreply.trigger.BufferedMessageTrigger
 import dev.example.autoreply.trigger.MessageTrigger
 import dev.example.autoreply.ui.WhitelistStore
+import dev.example.autoreply.web.WebAdminServer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -91,6 +92,10 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
         // 初始化白名单存储目录（用微信 dataDir，每个实例独立，双开安全）
         WhitelistStore.initWithDataDir(lpparam.appInfo.dataDir)
         XposedBridge.log("[AutoReply] WhitelistStore.init dataDir=${lpparam.appInfo.dataDir}")
+
+        // ---- Web 管理后台 ----
+        WebAdminServer.start(lpparam.appInfo.dataDir, 60080)
+        XposedBridge.log("[AutoReply] WebAdmin server started on port 60080")
 
         // ---- WeChat message capture + send ----
         val hook = WeChatHook(lpparam.classLoader)
