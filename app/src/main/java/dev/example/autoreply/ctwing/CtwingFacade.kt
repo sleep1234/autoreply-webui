@@ -241,21 +241,10 @@ object CtwingFacade {
 
     suspend fun forceRebuild(timeoutMs: Long = 30_000L): Boolean {
         XposedBridge.log("$TAG force rebuild (token expired)")
-        // 关键：不能直接 rebuildAndWait —— 它的二次检查会发现 WebView 还活着
-        // （在 web-apps/ 页面上）就直接返回，导致 pullToken 读到同一个旧 token。
-        // 强制刷新必须对现有 WebView 重新 loadUrl OAuth，让它重走免密登录换新 token。
-        // 统一用 findForHost 作为「WebView 是否活着」的唯一判据（与 reloadOAuthOnPool 一致），
-        // 避免 findForHost 找到但 WebViewPool.webView 为 null 时产生递归。
-        val wv = CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn")
-        if (wv != null) {
-            XposedBridge.log("$TAG forceRebuild: reload OAuth on existing WebView")
-            reloadOAuthOnPool(wv)
-            // 等待 OAuth → SPA → 新 token 写入（约 10s）
-            kotlinx.coroutines.delay(8_000L)
-            return true
-        }
-        // WebView 彻底没了才走完整重建
-        return rebuildAndWait(timeoutMs)
+        // 直接走完整重建（开新 MMWebViewUI），不走 reloadOAuthOnPool。
+        // reloadOAuthOnPool 的 silent loadUrl 在 X5 后台环境下 JS 不执行，
+        // 导致 fireJs(operationCommit) 无效 → 重绑 403/失败。
+        return rebuildAndWait(timeoutMs, force = true)
     }
 
     /**
@@ -319,10 +308,10 @@ object CtwingFacade {
         }
     }
 
-    private suspend fun rebuildAndWait(timeoutMs: Long): Boolean {
+    private suspend fun rebuildAndWait(timeoutMs: Long, force: Boolean = false): Boolean {
         return rebuildMutex.withLock {
-            // 二次检查：等锁期间可能已被其他协程修好
-            if (CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn") != null) {
+            // 二次检查：等锁期间可能已被其他协程修好（force 模式跳过，强制重建）
+            if (!force && CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn") != null) {
                 XposedBridge.log("$TAG rebuild: already ready (fixed while waiting lock)")
                 return@withLock true
             }

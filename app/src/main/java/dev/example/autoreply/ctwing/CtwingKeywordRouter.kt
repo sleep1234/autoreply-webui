@@ -3,7 +3,9 @@ package dev.example.autoreply.ctwing
 import de.robv.android.xposed.XposedBridge
 import dev.example.autoreply.hook.IncomingMessage
 import dev.example.autoreply.ui.WhitelistStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Routes incoming WeChat messages to CTWing operations.
@@ -278,171 +280,8 @@ object CtwingKeywordRouter {
                     else send("⚠️ 诊断未完成，请稍后重试或发送「续期」刷新登录态")
                 }
                 "rebind" -> {
-                    // 幂等：30s 内同一卡号不重复提交（重绑是真实业务工单，防手抖/重复触发）
-                    val lastTs = recentRebind[iccid]
-                    val now = System.currentTimeMillis()
-                    if (lastTs != null && (now - lastTs) < REBIND_IDEMPOTENT_WINDOW_MS) {
-                        send("⏳ $iccid 已提交重绑，请勿重复操作（${(REBIND_IDEMPOTENT_WINDOW_MS - (now - lastTs)) / 1000}s 后可重试）")
-                        return@withLock
-                    }
-                    send("🔄 正在提交重绑…")
-                    CtwingFacade.pullTokenOrRebuild()
-                    val token = NativeHttp.cachedToken ?: ""
-                    val idType = inferType(iccid)
-                    // 卡号类型中文标签：根据用户发来的号码类型回显
-                    val idTypeLabel = when (idType) {
-                        "msisdn" -> "接入号"
-                        "imsi" -> "IMSI"
-                        else -> "ICCID"
-                    }
-                    val payload = org.json.JSONObject().apply {
-                        put("type", idType)
-                        put("id", iccid)
-                        put("imei", "")
-                        put("source", "其他")
-                        put("orderNumber", "")
-                        put("sessionId", "")
-                        put("comment", "")
-                        put("bindType", "")
-                        put("file", org.json.JSONObject().put("ids", org.json.JSONArray()))
-                        put("operation", "JKCB")
-                    }.toString()
-                    XposedBridge.log("$TAG operationCommit: $payload")
-
-                    // 策略：优先 WebView XHR（原生 CSRF），轮询失败则 fallback NativeHttp
-                    CtwingFacade.operationCommit(payload)
-                    var raw: String = "null"
-                    var webViewOk = false
-                    for (round in 1..6) {
-                        kotlinx.coroutines.delay(1_000L)
-                        raw = CtwingFacade.pollDshResult()
-                        if (raw.contains("operationCommit-ok") || raw.contains("operationCommit-err")) {
-                            webViewOk = true; break
-                        }
-                        if (raw.length > 20 && raw != "null") { webViewOk = true; break }
-                    }
-                    // WebView XHR 回调未触发（双开/X5 后台常见），fallback NativeHttp
-                    if (!webViewOk) {
-                        XposedBridge.log("$TAG rebind: WebView XHR stalled, fallback NativeHttp")
-                        raw = runCatching {
-                            NativeHttp.operationCommit(token, payload)
-                        }.getOrElse { e ->
-                            XposedBridge.log("$TAG rebind NativeHttp failed: ${e.message}")
-                            """{"code":-1,"msg":"${e.message}"}"""
-                        }
-                    }
-                    CtwingFacade.releaseWakeLock()
-
-                    // 401 token 过期：强制重建 OAuth 换新 token，重新提交一次
-                    if (raw.contains("\"code\":401")) {
-                        XposedBridge.log("$TAG rebind: 401, force rebuild + retry")
-                        recentRebind.remove(iccid)  // 清除幂等，允许重试
-                        CtwingFacade.forceRebuild(40_000L)
-                        CtwingFacade.pullToken()
-                        val newToken = NativeHttp.cachedToken ?: ""
-                        raw = runCatching {
-                            NativeHttp.operationCommit(newToken, payload)
-                        }.getOrElse { e ->
-                            XposedBridge.log("$TAG rebind retry failed: ${e.message}")
-                            """{"code":-1,"msg":"${e.message}"}"""
-                        }
-                    }
-
-                    XposedBridge.log("$TAG rebind raw(${raw.length}): ${raw.take(600)}")
-                    val resultText = try {
-                        var cur: Any = raw.trim()
-                        var guard = 0
-                        while (cur is String && guard < 6) {
-                            val t = cur.trim()
-                            if (!(t.startsWith("\"") || t.startsWith("{"))) break
-                            cur = org.json.JSONTokener(t).nextValue()
-                            guard++
-                        }
-                        val wrap = cur as? org.json.JSONObject ?: throw RuntimeException("not object after $guard peels")
-                        // NativeHttp 返回原始 JSON（无 {status,body} 包装），直接作为 body
-                        // 旧格式：{status:200, body:"{...}"} → 提取 body 字段
-                        val bj: org.json.JSONObject? = when {
-                            wrap.has("status") && wrap.has("body") -> {
-                                val bodyTok = wrap.opt("body")
-                                when (bodyTok) {
-                                    is org.json.JSONObject -> bodyTok
-                                    is String -> {
-                                        var b: Any = bodyTok; var g2 = 0
-                                        while (b is String && g2 < 6) {
-                                            val bt = b.trim()
-                                            if (!(bt.startsWith("\"") || bt.startsWith("{"))) break
-                                            b = org.json.JSONTokener(bt).nextValue(); g2++
-                                        }
-                                        b as? org.json.JSONObject
-                                    }
-                                    else -> null
-                                }
-                            }
-                            else -> wrap // NativeHttp raw format
-                        }
-                        if (bj == null) throw RuntimeException("no body obj")
-                        val bcode = bj.optInt("code", -1)
-                        val bdata = bj.optJSONObject("data")
-                        val opStatus = bdata?.optString("status", "") ?: ""
-                        val remark = bdata?.optString("remark", "") ?: ""
-                        val workId = bdata?.optString("id", "") ?: ""
-
-                        when {
-                            bcode == 401 -> {
-                                recentRebind.remove(iccid)  // 可重试：token 刷新后就能过
-                                "⚠️ 重绑失败：登录已过期\n💡 请发送「续期」刷新后重试"
-                            }
-                            bcode != 0 -> {
-                                val msg = bj.optString("msg", "code=$bcode")
-                                // 永久性业务错误（权限、范围、卡归属）→ 保留幂等，重试无用
-                                // 临时性错误（网络、超时）→ 清除幂等，允许重试
-                                val isPermanent = isPermanentBusinessError(msg)
-                                if (isPermanent) {
-                                    // 保留幂等记录：这不是网络抖动，重试也不会变
-                                    recentRebind[iccid] = System.currentTimeMillis()
-                                    "❌ 重绑失败：$msg"
-                                } else {
-                                    recentRebind.remove(iccid)  // 可重试
-                                    "❌ 重绑失败：$msg\n💡 请稍后重试"
-                                }
-                            }
-                            opStatus.contains("成功") -> {
-                                // 只有明确成功才记录幂等（防重复工单），失败允许立刻重试
-                                recentRebind[iccid] = System.currentTimeMillis()
-                                val sb = StringBuilder("✅ 机卡重绑成功")
-                                if (workId.isNotBlank()) sb.append("（工单：$workId）")
-                                if (remark.isNotBlank()) sb.append("\n$remark")
-                                sb.toString()
-                            }
-                            opStatus.contains("失败") -> {
-                                // 业务侧明确失败（工单状态=失败），非网络抖动，保留幂等防重复
-                                recentRebind[iccid] = System.currentTimeMillis()
-                                val sb = StringBuilder("❌ 机卡重绑失败")
-                                if (remark.isNotBlank()) sb.append("：$remark")
-                                sb.toString()
-                            }
-                            else -> {
-                                // 已提交（异步工单，结果未定）：记录幂等防重复
-                                recentRebind[iccid] = System.currentTimeMillis()
-                                val sb = StringBuilder("✅ 机卡重绑已提交")
-                                if (workId.isNotBlank()) sb.append("（工单：$workId）")
-                                sb.append("\n⏳ 处理结果请稍后查询")
-                                sb.toString()
-                            }
-                        }
-                    } catch (e: Exception) {
-                        XposedBridge.log("$TAG rebind parse failed: ${e.message}")
-                        // 解析失败（可能已提交成功但格式异常）：保守起见记录幂等，防重复工单
-                        if (raw.contains("\"code\":0")) {
-                            recentRebind[iccid] = System.currentTimeMillis()
-                            "✅ 机卡重绑已提交成功"
-                        } else {
-                            // 明确失败/超时：清除幂等，允许重试
-                            recentRebind.remove(iccid)
-                            "⚠️ 重绑结果异常，请稍后重试"
-                        }
-                    }
-                    send("$resultText\n$idTypeLabel：$iccid")
+                    val resultText = executeRebind(iccid)
+                    send("$resultText\n${idTypeLabel(iccid)}：$iccid")
                 }
             }
             } // withLock
@@ -457,6 +296,169 @@ object CtwingKeywordRouter {
     // ------------------------------------------------------------------
     //  Formatting (best-effort; JSON structure is version-specific)
     // ------------------------------------------------------------------
+
+    /** 重绑卡号类型中文标签。 */
+    internal fun idTypeLabel(iccid: String): String = when (inferType(iccid)) {
+        "msisdn" -> "接入号"
+        "imsi" -> "IMSI"
+        else -> "ICCID"
+    }
+
+    /**
+     * 重绑核心逻辑（窗口和 Web 共用）：
+     * 幂等 → pullTokenOrRebuild → payload → WebView XHR 轮询 → fallback NativeHttp → 401 重建重试 → 解析。
+     * 返回结果文案（不含卡号标签，由调用方拼）。
+     */
+    internal suspend fun executeRebind(iccid: String): String {
+        // 幂等：30s 内同一卡号不重复提交
+        val lastTs = recentRebind[iccid]
+        val now = System.currentTimeMillis()
+        if (lastTs != null && (now - lastTs) < REBIND_IDEMPOTENT_WINDOW_MS) {
+            return "⏳ $iccid 已提交重绑，请勿重复操作（${(REBIND_IDEMPOTENT_WINDOW_MS - (now - lastTs)) / 1000}s 后可重试）"
+        }
+        CtwingFacade.pullTokenOrRebuild()
+        val token = NativeHttp.cachedToken ?: ""
+        val idType = inferType(iccid)
+        val payload = org.json.JSONObject().apply {
+            put("type", idType)
+            put("id", iccid)
+            put("imei", "")
+            put("source", "其他")
+            put("orderNumber", "")
+            put("sessionId", "")
+            put("comment", "")
+            put("bindType", "")
+            put("file", org.json.JSONObject().put("ids", org.json.JSONArray()))
+            put("operation", "JKCB")
+        }.toString()
+        XposedBridge.log("$TAG operationCommit: $payload")
+
+        // 策略：优先 WebView XHR（原生 CSRF），轮询失败则 fallback NativeHttp
+        CtwingFacade.operationCommit(payload)
+        var raw: String = "null"
+        var webViewOk = false
+        for (round in 1..6) {
+            kotlinx.coroutines.delay(1_000L)
+            raw = CtwingFacade.pollDshResult()
+            if (raw.contains("operationCommit-ok") || raw.contains("operationCommit-err")) {
+                webViewOk = true; break
+            }
+            if (raw.length > 20 && raw != "null") { webViewOk = true; break }
+        }
+        // WebView XHR 回调未触发（双开/X5 后台常见），fallback NativeHttp
+        if (!webViewOk) {
+            XposedBridge.log("$TAG rebind: WebView XHR stalled, fallback NativeHttp")
+            raw = withContext(Dispatchers.IO) {
+                runCatching { NativeHttp.operationCommit(token, payload) }
+                    .getOrElse { e ->
+                        XposedBridge.log("$TAG rebind NativeHttp failed: ${e.message}")
+                        """{"code":-1,"msg":"${e.message}"}"""
+                    }
+            }
+        }
+        CtwingFacade.releaseWakeLock()
+
+        // 401 token 过期：强制重建 OAuth 换新 token，重新提交一次
+        if (raw.contains("\"code\":401")) {
+            XposedBridge.log("$TAG rebind: 401, force rebuild + retry")
+            recentRebind.remove(iccid)  // 清除幂等，允许重试
+            CtwingFacade.forceRebuild(40_000L)
+            CtwingFacade.pullToken()
+            val newToken = NativeHttp.cachedToken ?: ""
+            raw = withContext(Dispatchers.IO) {
+                runCatching { NativeHttp.operationCommit(newToken, payload) }
+                    .getOrElse { e ->
+                        XposedBridge.log("$TAG rebind retry failed: ${e.message}")
+                        """{"code":-1,"msg":"${e.message}"}"""
+                    }
+            }
+        }
+
+        XposedBridge.log("$TAG rebind raw(${raw.length}): ${raw.take(600)}")
+        return try {
+            var cur: Any = raw.trim()
+            var guard = 0
+            while (cur is String && guard < 6) {
+                val t = cur.trim()
+                if (!(t.startsWith("\"") || t.startsWith("{"))) break
+                cur = org.json.JSONTokener(t).nextValue()
+                guard++
+            }
+            val wrap = cur as? org.json.JSONObject ?: throw RuntimeException("not object after $guard peels")
+            val bj: org.json.JSONObject? = when {
+                wrap.has("status") && wrap.has("body") -> {
+                    val bodyTok = wrap.opt("body")
+                    when (bodyTok) {
+                        is org.json.JSONObject -> bodyTok
+                        is String -> {
+                            var b: Any = bodyTok; var g2 = 0
+                            while (b is String && g2 < 6) {
+                                val bt = b.trim()
+                                if (!(bt.startsWith("\"") || bt.startsWith("{"))) break
+                                b = org.json.JSONTokener(bt).nextValue(); g2++
+                            }
+                            b as? org.json.JSONObject
+                        }
+                        else -> null
+                    }
+                }
+                else -> wrap // NativeHttp raw format
+            }
+            if (bj == null) throw RuntimeException("no body obj")
+            val bcode = bj.optInt("code", -1)
+            val bdata = bj.optJSONObject("data")
+            val opStatus = bdata?.optString("status", "") ?: ""
+            val remark = bdata?.optString("remark", "") ?: ""
+            val workId = bdata?.optString("id", "") ?: ""
+
+            when {
+                bcode == 401 -> {
+                    recentRebind.remove(iccid)
+                    "⚠️ 重绑失败：登录已过期\n💡 请发送「续期」刷新后重试"
+                }
+                bcode != 0 -> {
+                    val msg = bj.optString("msg", "code=$bcode")
+                    val isPermanent = isPermanentBusinessError(msg)
+                    if (isPermanent) {
+                        recentRebind[iccid] = System.currentTimeMillis()
+                        "❌ 重绑失败：$msg"
+                    } else {
+                        recentRebind.remove(iccid)
+                        "❌ 重绑失败：$msg\n💡 请稍后重试"
+                    }
+                }
+                opStatus.contains("成功") -> {
+                    recentRebind[iccid] = System.currentTimeMillis()
+                    val sb = StringBuilder("✅ 机卡重绑成功")
+                    if (workId.isNotBlank()) sb.append("（工单：$workId）")
+                    if (remark.isNotBlank()) sb.append("\n$remark")
+                    sb.toString()
+                }
+                opStatus.contains("失败") -> {
+                    recentRebind[iccid] = System.currentTimeMillis()
+                    val sb = StringBuilder("❌ 机卡重绑失败")
+                    if (remark.isNotBlank()) sb.append("：$remark")
+                    sb.toString()
+                }
+                else -> {
+                    recentRebind[iccid] = System.currentTimeMillis()
+                    val sb = StringBuilder("✅ 机卡重绑已提交")
+                    if (workId.isNotBlank()) sb.append("（工单：$workId）")
+                    sb.append("\n⏳ 处理结果请稍后查询")
+                    sb.toString()
+                }
+            }
+        } catch (e: Exception) {
+            XposedBridge.log("$TAG rebind parse failed: ${e.message}")
+            if (raw.contains("\"code\":0")) {
+                recentRebind[iccid] = System.currentTimeMillis()
+                "✅ 机卡重绑已提交成功"
+            } else {
+                recentRebind.remove(iccid)
+                "⚠️ 重绑结果异常，请稍后重试"
+            }
+        }
+    }
 
     /**
      * 通用 NativeHttp GET 请求：自动处理 token 拉取 + 401 重建重试。

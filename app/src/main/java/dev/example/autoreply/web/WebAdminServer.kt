@@ -156,58 +156,31 @@ object WebAdminServer {
     private suspend fun rebind(p: Map<String, String>): Triple<Int, String, String> {
         val iccid = p["iccid"] ?: return err("请提供卡号")
         return try {
-            val idType = CtwingKeywordRouter.inferType(iccid)
+            // 直接复用窗口已测通的重绑逻辑
             val result = CtwingFacade.webViewMutex.withLock {
-                CtwingFacade.pullTokenOrRebuild()
-                val token = NativeHttp.cachedToken ?: ""
-                val payload = org.json.JSONObject().apply {
-                    put("type", idType); put("id", iccid); put("imei", "")
-                    put("source", "其他"); put("orderNumber", ""); put("sessionId", "")
-                    put("comment", ""); put("bindType", "")
-                    put("file", org.json.JSONObject().put("ids", org.json.JSONArray()))
-                    put("operation", "JKCB")
-                }.toString()
-
-                CtwingFacade.operationCommit(payload)
-                var raw = "null"; var wvOk = false
-                for (i in 1..6) {
-                    delay(1_000L); raw = CtwingFacade.pollDshResult()
-                    if (raw.contains("operationCommit-ok") || raw.contains("operationCommit-err")) { wvOk = true; break }
-                    if (raw.length > 20 && raw != "null") { wvOk = true; break }
-                }
-                if (!wvOk) raw = withContext(Dispatchers.IO) { runCatching { NativeHttp.operationCommit(token, payload) }.getOrElse { e -> """{"code":-1,"msg":"${e.message}"}""" } }
-
-                if (raw.contains("\"code\":401")) {
-                    CtwingFacade.forceRebuild(40_000L)
-                    CtwingFacade.pullToken()
-                    val nt = NativeHttp.cachedToken ?: ""
-                    raw = withContext(Dispatchers.IO) { runCatching { NativeHttp.operationCommit(nt, payload) }.getOrElse { e -> """{"code":-1,"msg":"${e.message}"}""" } }
-                }
-                CtwingFacade.releaseWakeLock()
-                parseRebindResult(raw, iccid, idType)
+                CtwingKeywordRouter.executeRebind(iccid)
             }
-            ok(result)
+            ok("$result\n${CtwingKeywordRouter.idTypeLabel(iccid)}：$iccid")
         } catch (e: Exception) { err("重绑失败: ${e.message}") }
     }
 
     private suspend fun renew(): Triple<Int, String, String> {
         return try {
             val old = NativeHttp.cachedToken ?: ""
+            // 和 WeChat 窗口"续期"命令完全一致：forceRebuild + pullToken
             CtwingFacade.forceRebuild(40_000L)
-            // 轮询等待 OAuth → SPA → 新 token 写入（最长 40 秒）
-            var nt = NativeHttp.cachedToken ?: ""
-            repeat(12) {
-                delay(3_500L)
-                CtwingFacade.pullToken()
-                nt = NativeHttp.cachedToken ?: ""
-                if (nt.isNotBlank() && nt != old) return@repeat
-            }
+            CtwingFacade.pullToken()
+            val nt = NativeHttp.cachedToken ?: ""
             val json = org.json.JSONObject().apply {
-                put("ok", true); put("oldToken", old); put("newToken", nt)
+                put("ok", true)
+                put("oldToken", old)
+                put("newToken", nt)
                 put("changed", old != nt)
             }
             Triple(200, "application/json; charset=utf-8", json.toString())
-        } catch (e: Exception) { err("续期失败: ${e.message}") }
+        } catch (e: Exception) {
+            err("续期失败: ${e.message}")
+        }
     }
 
     private fun parseRebindResult(raw: String, iccid: String, idType: String): String {
