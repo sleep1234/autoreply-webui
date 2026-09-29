@@ -846,14 +846,4 @@ object CtwingKeywordRouter {
             }
         }
     }
-
-    private fun formatRebind(json: String): String {
-        if (isCiphertext(json)) return "⚠️ 重绑结果返回密文，尚未解密。"
-        return runCatching {
-            val obj = org.json.JSONObject(json)
-            val success = obj.optBoolean("success", obj.optString("code", "0") == "0")
-            if (success) "✅ 机卡重绑已提交成功"
-            else "⚠️ 重绑结果：${json.take(300)}"
-        }.getOrElse { "📋 重绑提交结果：\n${json.take(300)}" }
-    }
 }

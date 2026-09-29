@@ -106,25 +106,6 @@ object CtwingFacade {
         throw RuntimeException("CTWing IPC timed out after ${TIMEOUT_MS}ms")
     }
 
-    private suspend fun awaitDeferred(
-        rid: String,
-        deferred: kotlinx.coroutines.CompletableDeferred<String>
-    ): String {
-        try {
-            val result = withTimeout(TIMEOUT_MS) { deferred.await() }
-            XposedBridge.log("$TAG callJs [$rid] OK len=${result.length}")
-            return result
-        } catch (e: TimeoutCancellationException) {
-            XposedBridge.log("$TAG callJs [$rid] TIMEOUT")
-            CtwingJsBridge.pendingRequests.remove(rid)
-            throw RuntimeException("CTWing API call timed out after ${TIMEOUT_MS}ms")
-        } catch (e: Exception) {
-            XposedBridge.log("$TAG callJs [$rid] FAILED: ${e.message}")
-            CtwingJsBridge.pendingRequests.remove(rid)
-            throw e
-        }
-    }
-
     // ------------------------------------------------------------------
     //  Public API
     // ------------------------------------------------------------------
@@ -263,10 +244,12 @@ object CtwingFacade {
         // 关键：不能直接 rebuildAndWait —— 它的二次检查会发现 WebView 还活着
         // （在 web-apps/ 页面上）就直接返回，导致 pullToken 读到同一个旧 token。
         // 强制刷新必须对现有 WebView 重新 loadUrl OAuth，让它重走免密登录换新 token。
-        val wv = WebViewPool.webView ?: CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn")
+        // 统一用 findForHost 作为「WebView 是否活着」的唯一判据（与 reloadOAuthOnPool 一致），
+        // 避免 findForHost 找到但 WebViewPool.webView 为 null 时产生递归。
+        val wv = CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn")
         if (wv != null) {
             XposedBridge.log("$TAG forceRebuild: reload OAuth on existing WebView")
-            reloadOAuthOnPool()
+            reloadOAuthOnPool(wv)
             // 等待 OAuth → SPA → 新 token 写入（约 10s）
             kotlinx.coroutines.delay(8_000L)
             return true
@@ -280,12 +263,14 @@ object CtwingFacade {
      * The stolen WebView lives in the transparent overlay window so
      * loadUrl works even with screen off. After the redirect chain
      * completes (~8s), the SPA's 免密登录 will write a fresh token to cookie.
+     *
+     * [wv] 由调用方传入（已确认非 null），避免内部再查一次造成递归。
      */
-    suspend fun reloadOAuthOnPool() {
-        val wv = WebViewPool.webView
-        if (wv == null) {
-            XposedBridge.log("$TAG reloadOAuth: pool WebView is null, doing full rebuild")
-            forceRebuild(40_000L)
+    suspend fun reloadOAuthOnPool(wv: Any? = null) {
+        val target = wv ?: WebViewPool.webView
+        if (target == null) {
+            XposedBridge.log("$TAG reloadOAuth: no WebView, doing full rebuild")
+            rebuildAndWait(40_000L)
             return
         }
         try {
@@ -298,11 +283,11 @@ object CtwingFacade {
                 "&response_type=code&scope=snsapi_base&state=oauthsszc#wechat_redirect"
             
             XposedBridge.log("$TAG reloadOAuth: loading OAuth URL on pool WebView")
-            wv.javaClass.getMethod("loadUrl", String::class.java).invoke(wv, oauthUrl)
+            target.javaClass.getMethod("loadUrl", String::class.java).invoke(target, oauthUrl)
             // SPA will auto-complete auth + write fresh ACCESS_TOKEN cookie in ~10s
         } catch (e: Exception) {
             XposedBridge.log("$TAG reloadOAuth failed: ${e.message}, fallback to rebuild")
-            forceRebuild(40_000L)
+            rebuildAndWait(40_000L)
         }
     }
 
@@ -444,51 +429,12 @@ object CtwingFacade {
         return "dispatched"
     }
 
-    /** Query basicInfo via WebView (for rebind: extract bindImei/orderNumber/sessionId). */
-    suspend fun queryBasicInfo(cardNo: String, type: String) {
-        acquireWakeLock()
-        fireJs("window.__ctwing.queryBasicInfo('${escapeJs(cardNo)}','$type')")
-    }
-
     /** POST operationCommit via WebView (for rebind JKCB). */
     suspend fun operationCommit(payload: String) {
         acquireWakeLock()
         val escaped = escapeJs(payload)
         fireJs("window.__ctwing.operationCommit('$escaped')")
     }
-
-    /** Parse basicInfo response → BindInfo (bindImei, lastImei, orderNumber, sessionId, bindType). */
-    fun parseBindInfo(raw: String): BindInfo? {
-        return try {
-            // readApiResponses returns evaluateJavascript JSON-encoded string:
-            // "{\"code\":0,\"data\":{...}}" → unescape first
-            var body = raw.trim()
-            if (body.startsWith("\"") && body.endsWith("\"")) {
-                body = body.substring(1, body.length - 1)
-            }
-            body = body.replace("\\\"", "\"").replace("\\\\", "\\")
-            val json = org.json.JSONObject(body)
-            val data = json.optJSONObject("data") ?: return null
-            BindInfo(
-                bindImei = data.optString("bindImei", ""),
-                lastImei = data.optString("lastImei", ""),
-                orderNumber = data.optString("id", "").ifBlank { data.optString("orderNumber", "") },
-                sessionId = data.optString("sessionId", ""),
-                bindType = data.optString("bindType", "")
-            )
-        } catch (e: Exception) {
-            XposedBridge.log("$TAG parseBindInfo failed: ${e.message}")
-            null
-        }
-    }
-
-    data class BindInfo(
-        val bindImei: String,
-        val lastImei: String,
-        val orderNumber: String,
-        val sessionId: String,
-        val bindType: String
-    )
 
     /** Release wake lock after result is read (called by router when done). */
     fun releaseWakeLock() {
