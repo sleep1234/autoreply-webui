@@ -283,7 +283,10 @@ object CtwingFacade {
                 "&response_type=code&scope=snsapi_base&state=oauthsszc#wechat_redirect"
             
             XposedBridge.log("$TAG reloadOAuth: loading OAuth URL on pool WebView")
-            target.javaClass.getMethod("loadUrl", String::class.java).invoke(target, oauthUrl)
+            // loadUrl 是 WebView UI 操作，必须在主线程执行
+            withContext(Dispatchers.Main) {
+                target.javaClass.getMethod("loadUrl", String::class.java).invoke(target, oauthUrl)
+            }
             // SPA will auto-complete auth + write fresh ACCESS_TOKEN cookie in ~10s
         } catch (e: Exception) {
             XposedBridge.log("$TAG reloadOAuth failed: ${e.message}, fallback to rebuild")

@@ -1,7 +1,16 @@
 package dev.example.autoreply.web
 
+import android.os.Handler
+import android.os.Looper
 import de.robv.android.xposed.XposedBridge
+import dev.example.autoreply.ctwing.CtwingFacade
+import dev.example.autoreply.ctwing.CtwingKeywordRouter
+import dev.example.autoreply.ctwing.CtwingWebViewHook
+import dev.example.autoreply.ctwing.NativeHttp
+import dev.example.autoreply.hook.TinkerGuard
+import dev.example.autoreply.ui.WhitelistStore
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.withLock
 import java.io.*
 import java.net.ServerSocket
 import java.net.Socket
@@ -11,20 +20,18 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 嵌入式 Web 管理后台，直接跑在微信主进程的协程里。
- * 
- * 零外部依赖（纯 ServerSocket），避免 classloader 冲突。
- * 双开端口：user 0 → 8080，user 999 → 8081。
+ * 所有操作直接复用已有测通逻辑（CtwingKeywordRouter/CtwingFacade/NativeHttp），
+ * 零额外造轮子。
  */
 object WebAdminServer {
 
     private const val TAG = "[WebAdmin]"
+    private val mainHandler = Handler(Looper.getMainLooper())
     
-    // 密码存 {dataDir}/files/autoreply/web_password.hash（SHA-256）
     private var passwordHash: String? = null
     private var dataDir: File? = null
-    private var port: Int = 8080
+    private var port: Int = 60080
     
-    // 会话 token → 登录时间戳（5 分钟过期）
     private val sessions = ConcurrentHashMap<String, Long>()
     private const val SESSION_TTL_MS = 5 * 60 * 1000L
 
@@ -37,8 +44,8 @@ object WebAdminServer {
         dataDir = File(appDataDir, "files/autoreply")
         dataDir!!.mkdirs()
         port = userPort
+        val maxRetries = 5
 
-        // 加载或创建密码（默认密码 "admin123"）
         val pwFile = File(dataDir, "web_password.hash")
         if (pwFile.exists()) {
             passwordHash = pwFile.readText().trim()
@@ -49,11 +56,25 @@ object WebAdminServer {
         }
 
         serverJob = CoroutineScope(Dispatchers.IO).launch {
+            var server: ServerSocket? = null
+            for (attempt in 0 until maxRetries) {
+                try {
+                    server = ServerSocket(port + attempt).apply { reuseAddress = true }
+                    port += attempt
+                    break
+                } catch (e: Exception) {
+                    XposedBridge.log("$TAG 端口 ${port + attempt} 绑定失败: ${e.message}")
+                    if (attempt == maxRetries - 1) {
+                        XposedBridge.log("$TAG 所有端口都不可用，放弃启动")
+                        return@launch
+                    }
+                }
+            }
+            val srv = server ?: return@launch
+            XposedBridge.log("$TAG HTTP 服务已启动，端口 $port")
             try {
-                val server = ServerSocket(port)
-                XposedBridge.log("$TAG HTTP 服务已启动，端口 $port")
                 while (isActive) {
-                    val client = runCatching { server.accept() }.getOrNull() ?: continue
+                    val client = runCatching { srv.accept() }.getOrNull() ?: continue
                     launch { handleClient(client) }
                 }
             } catch (e: Exception) {
@@ -71,18 +92,18 @@ object WebAdminServer {
 
     private suspend fun handleClient(socket: Socket) {
         try {
+            XposedBridge.log("$TAG 收到连接: ${socket.inetAddress.hostAddress}")
             socket.soTimeout = 30_000
             val input = BufferedReader(InputStreamReader(socket.getInputStream()))
-            val output = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
+            val output = socket.getOutputStream()
 
-            // 读请求行
             val requestLine = input.readLine() ?: return
+            XposedBridge.log("$TAG 请求: $requestLine")
             val parts = requestLine.split(" ")
             if (parts.size < 2) return
             val method = parts[0]
             val rawPath = parts[1]
 
-            // 读 headers
             val headers = mutableMapOf<String, String>()
             while (true) {
                 val line = input.readLine() ?: break
@@ -91,7 +112,6 @@ object WebAdminServer {
                 if (colon > 0) headers[line.substring(0, colon).lowercase()] = line.substring(colon + 2)
             }
 
-            // 读 body（POST）
             var body = ""
             val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
             if (contentLength > 0) {
@@ -100,7 +120,6 @@ object WebAdminServer {
                 body = String(buf)
             }
 
-            // 解析路径和查询参数
             val queryIdx = rawPath.indexOf("?")
             val path = if (queryIdx >= 0) rawPath.substring(0, queryIdx) else rawPath
             val queryStr = if (queryIdx >= 0) rawPath.substring(queryIdx + 1) else ""
@@ -109,17 +128,28 @@ object WebAdminServer {
 
             val (statusCode, contentType, responseBody) = route(method, path, params, bodyParams, headers)
 
-            output.write("HTTP/1.1 $statusCode OK\r\n")
-            output.write("Content-Type: $contentType\r\n")
-            output.write("Content-Length: ${responseBody.toByteArray().size}\r\n")
-            output.write("Access-Control-Allow-Origin: *\r\n")
-            output.write("Connection: close\r\n")
-            output.write("\r\n")
-            output.write(responseBody)
+            val bodyBytes = responseBody.toByteArray(Charsets.UTF_8)
+            val statusText = when (statusCode) {
+                200 -> "OK"; 400 -> "Bad Request"; 401 -> "Unauthorized"; 404 -> "Not Found"
+                else -> "OK"
+            }
+            val headBytes = buildString {
+                append("HTTP/1.1 $statusCode $statusText\r\n")
+                append("Content-Type: $contentType\r\n")
+                append("Content-Length: ${bodyBytes.size}\r\n")
+                append("Access-Control-Allow-Origin: *\r\n")
+                append("Connection: close\r\n")
+                append("\r\n")
+            }.toByteArray(Charsets.UTF_8)
+
+            output.write(headBytes)
+            output.write(bodyBytes)
             output.flush()
-        } catch (e: Exception) {
-            // 客户端断开，忽略
+            runCatching { socket.shutdownOutput() }
+            XposedBridge.log("$TAG 响应已发送: $statusCode (${bodyBytes.size}B)")
+        } catch (_: Exception) {
         } finally {
+            try { Thread.sleep(200) } catch (_: Exception) {}
             runCatching { socket.close() }
         }
     }
@@ -159,52 +189,25 @@ object WebAdminServer {
     }
 
     private fun handleLogin(params: Map<String, String>): Triple<Int, String, String> {
-        val pw = params["password"] ?: ""
-        val hash = sha256(pw)
-        if (hash != passwordHash) {
-            return Triple(401, "application/json", """{"ok":false,"msg":"密码错误"}""")
-        }
+        val hash = sha256(params["password"] ?: "")
+        if (hash != passwordHash) return Triple(401, "application/json", """{"ok":false,"msg":"密码错误"}""")
         val token = randomToken()
         sessions[token] = System.currentTimeMillis()
         return Triple(200, "application/json", """{"ok":true,"token":"$token"}""")
     }
 
-    // ---- API 处理 ----
+    // ---- API：全部直接复用已有测通逻辑 ----
 
     private fun handleStatus(): Triple<Int, String, String> {
-        val wvAlive = runCatching {
-            val clz = Class.forName("dev.example.autoreply.ctwing.CtwingWebViewHook")
-            val m = clz.getMethod("currentWebView")
-            m.invoke(null) != null
-        }.getOrDefault(false)
-
-        val token = runCatching {
-            val clz = Class.forName("dev.example.autoreply.ctwing.NativeHttp")
-            val f = clz.getDeclaredField("cachedToken")
-            f.isAccessible = true
-            f.get(null) as? String ?: ""
-        }.getOrDefault("")
-
-        val whitelistCount = runCatching {
-            val clz = Class.forName("dev.example.autoreply.ui.WhitelistStore")
-            val m = clz.getMethod("list")
-            val list = m.invoke(null) as? List<*> ?: emptyList<Any>()
-            list.size
-        }.getOrDefault(0)
-
-        val tinkerSummary = runCatching {
-            val clz = Class.forName("dev.example.autoreply.hook.TinkerGuard")
-            val m = clz.getMethod("statusSummary")
-            m.invoke(null) as? String ?: ""
-        }.getOrDefault("")
-
+        val wvAlive = CtwingWebViewHook.currentWebView() != null
+        val token = NativeHttp.cachedToken ?: ""
         val json = org.json.JSONObject().apply {
             put("ok", true)
             put("webViewAlive", wvAlive)
             put("token", token)
             put("tokenLen", token.length)
-            put("whitelistCount", whitelistCount)
-            put("tinkerSummary", tinkerSummary)
+            put("whitelistCount", WhitelistStore.list().size)
+            put("tinkerSummary", TinkerGuard.statusSummary())
         }
         return Triple(200, "application/json; charset=utf-8", json.toString())
     }
@@ -212,7 +215,16 @@ object WebAdminServer {
     private suspend fun handleQuery(params: Map<String, String>): Triple<Int, String, String> {
         val iccid = params["iccid"] ?: return errorJson("请提供卡号")
         return try {
-            val result = executeCtwingOp("query", iccid)
+            val idType = CtwingKeywordRouter.inferType(iccid)
+            // 直接复用 nativeGetWithRetry（自动 token 拉取 + 401 重试），跑在 IO 线程
+            val raw = CtwingKeywordRouter.nativeGetWithRetry("web-query") { token ->
+                NativeHttp.queryCard(token, idType, iccid)
+            }
+            val errorMsg = raw?.let { CtwingKeywordRouter.extractQueryError(it) }
+            if (errorMsg != null) return errorJson("查询失败：$errorMsg")
+            val bestResp = raw?.let { CtwingKeywordRouter.extractBestResponse(it) }
+            val result = bestResp?.let { CtwingKeywordRouter.formatCardInfo(it) }
+                ?: "查询未完成，请稍后重试"
             Triple(200, "application/json; charset=utf-8", """{"ok":true,"result":${org.json.JSONObject.quote(result)}}""")
         } catch (e: Exception) {
             errorJson("查询失败: ${e.message}")
@@ -222,7 +234,15 @@ object WebAdminServer {
     private suspend fun handleDiagnose(params: Map<String, String>): Triple<Int, String, String> {
         val iccid = params["iccid"] ?: return errorJson("请提供卡号")
         return try {
-            val result = executeCtwingOp("diagnose", iccid)
+            val idType = CtwingKeywordRouter.inferType(iccid)
+            val raw = CtwingKeywordRouter.nativeGetWithRetry("web-diagnose") { token ->
+                NativeHttp.diagnose(token, idType, iccid)
+            }
+            val errorMsg = raw?.let { CtwingKeywordRouter.extractQueryError(it) }
+            if (errorMsg != null) return errorJson("诊断失败：$errorMsg")
+            val bestResp = raw?.let { CtwingKeywordRouter.extractBestResponse(it) }
+            val result = bestResp?.let { CtwingKeywordRouter.formatDiagnosis(it) }
+                ?: "诊断未完成，请稍后重试"
             Triple(200, "application/json; charset=utf-8", """{"ok":true,"result":${org.json.JSONObject.quote(result)}}""")
         } catch (e: Exception) {
             errorJson("诊断失败: ${e.message}")
@@ -231,123 +251,135 @@ object WebAdminServer {
 
     private suspend fun handleRebind(params: Map<String, String>): Triple<Int, String, String> {
         val iccid = params["iccid"] ?: return errorJson("请提供卡号")
-        return try {
-            val result = executeCtwingOp("rebind", iccid)
-            Triple(200, "application/json; charset=utf-8", """{"ok":true,"result":${org.json.JSONObject.quote(result)}}""")
-        } catch (e: Exception) {
-            errorJson("重绑失败: ${e.message}")
+        return withContext(Dispatchers.Main) {
+            try {
+                val idType = CtwingKeywordRouter.inferType(iccid)
+                CtwingFacade.webViewMutex.withLock {
+                    // 复用聊天重绑的完整链路：pullTokenOrRebuild → payload → XHR fallback NativeHttp → parse
+                    CtwingFacade.pullTokenOrRebuild()
+                    val token = NativeHttp.cachedToken ?: ""
+                    val payload = org.json.JSONObject().apply {
+                        put("type", idType)
+                        put("id", iccid)
+                        put("imei", "")
+                        put("source", "其他")
+                        put("orderNumber", "")
+                        put("sessionId", "")
+                        put("comment", "")
+                        put("bindType", "")
+                        put("file", org.json.JSONObject().put("ids", org.json.JSONArray()))
+                        put("operation", "JKCB")
+                    }.toString()
+
+                    // 优先 WebView XHR，轮询 fallback NativeHttp
+                    CtwingFacade.operationCommit(payload)
+                    var raw = "null"
+                    var webViewOk = false
+                    for (round in 1..6) {
+                        kotlinx.coroutines.delay(1_000L)
+                        raw = CtwingFacade.pollDshResult()
+                        if (raw.contains("operationCommit-ok") || raw.contains("operationCommit-err")) { webViewOk = true; break }
+                        if (raw.length > 20 && raw != "null") { webViewOk = true; break }
+                    }
+                    if (!webViewOk) {
+                        raw = runCatching {
+                            NativeHttp.operationCommit(token, payload)
+                        }.getOrElse { e -> """{"code":-1,"msg":"${e.message}"}""" }
+                    }
+
+                    if (raw.contains("\"code\":401")) {
+                        CtwingFacade.forceRebuild(40_000L)
+                        CtwingFacade.pullToken()
+                        val newToken = NativeHttp.cachedToken ?: ""
+                        raw = runCatching {
+                            NativeHttp.operationCommit(newToken, payload)
+                        }.getOrElse { e -> """{"code":-1,"msg":"${e.message}"}""" }
+                    }
+                    CtwingFacade.releaseWakeLock()
+
+                    // 解析结果（和内联重绑逻辑等价）
+                    val resultText = parseRebindResult(raw, iccid, idType)
+                    Triple(200, "application/json; charset=utf-8", """{"ok":true,"result":${org.json.JSONObject.quote(resultText)}}""")
+                }
+            } catch (e: Exception) {
+                errorJson("重绑失败: ${e.message}")
+            }
         }
     }
 
     private suspend fun handleRenew(): Triple<Int, String, String> {
+        return withContext(Dispatchers.Main) {
+            try {
+                val oldToken = NativeHttp.cachedToken ?: ""
+                CtwingFacade.forceRebuild(40_000L)
+                CtwingFacade.pullToken()
+                delay(10_000L) // 等待 OAuth → 新 token 写入
+                val newToken = NativeHttp.cachedToken ?: ""
+                val json = org.json.JSONObject().apply {
+                    put("ok", true)
+                    put("oldToken", oldToken)
+                    put("newToken", newToken)
+                    put("changed", oldToken != newToken)
+                }
+                Triple(200, "application/json; charset=utf-8", json.toString())
+            } catch (e: Exception) {
+                errorJson("续期失败: ${e.message}")
+            }
+        }
+    }
+
+    /** 重绑结果解析（和内联逻辑一致）。 */
+    private fun parseRebindResult(raw: String, iccid: String, idType: String): String {
+        val idTypeLabel = when (idType) { "msisdn" -> "接入号"; "imsi" -> "IMSI"; else -> "ICCID" }
         return try {
-            val oldToken = getToken()
-            forceRenew()
-            delay(10_000L) // 等待 OAuth 完成
-            val newToken = getToken()
-            val changed = oldToken != newToken
-            val json = org.json.JSONObject().apply {
-                put("ok", true)
-                put("oldToken", oldToken)
-                put("newToken", newToken)
-                put("changed", changed)
+            var cur: Any = raw.trim(); var guard = 0
+            while (cur is String && guard < 6) {
+                val t = cur.trim()
+                if (!(t.startsWith("\"") || t.startsWith("{"))) break
+                cur = org.json.JSONTokener(t).nextValue(); guard++
             }
-            Triple(200, "application/json; charset=utf-8", json.toString())
+            val wrap = cur as? org.json.JSONObject ?: throw RuntimeException("not object")
+            val bj = when {
+                wrap.has("status") && wrap.has("body") -> {
+                    when (val bt = wrap.opt("body")) {
+                        is org.json.JSONObject -> bt
+                        is String -> org.json.JSONObject(org.json.JSONTokener(bt).nextValue() as String)
+                        else -> null
+                    }
+                }
+                else -> wrap
+            } ?: throw RuntimeException("no body")
+            val bcode = bj.optInt("code", -1)
+            val bdata = bj.optJSONObject("data")
+            val opStatus = bdata?.optString("status", "") ?: ""
+            val remark = bdata?.optString("remark", "") ?: ""
+            val workId = bdata?.optString("id", "") ?: ""
+            val result = when {
+                bcode == 401 -> "⚠️ 重绑失败：登录已过期\n💡 请发送「续期」刷新后重试"
+                bcode != 0 -> {
+                    val msg = bj.optString("msg", "code=$bcode")
+                    "❌ 重绑失败：$msg"
+                }
+                opStatus.contains("成功") -> buildString {
+                    append("✅ 机卡重绑成功")
+                    if (workId.isNotBlank()) append("（工单：$workId）")
+                    if (remark.isNotBlank()) append("\n$remark")
+                }
+                opStatus.contains("失败") -> buildString {
+                    append("❌ 机卡重绑失败")
+                    if (remark.isNotBlank()) append("：$remark")
+                }
+                else -> buildString {
+                    append("✅ 机卡重绑已提交")
+                    if (workId.isNotBlank()) append("（工单：$workId）")
+                    append("\n⏳ 处理结果请稍后查询")
+                }
+            }
+            "$result\n$idTypeLabel：$iccid"
         } catch (e: Exception) {
-            errorJson("续期失败: ${e.message}")
+            if (raw.contains("\"code\":0")) "✅ 机卡重绑已提交成功\n$idTypeLabel：$iccid"
+            else "⚠️ 重绑结果异常，请稍后重试\n$idTypeLabel：$iccid"
         }
-    }
-
-    // ---- CTWing 操作桥接（通过反射调用，避免直接依赖） ----
-
-    private suspend fun executeCtwingOp(op: String, iccid: String): String {
-        return withContext(Dispatchers.IO) {
-            val routerClz = Class.forName("dev.example.autoreply.ctwing.CtwingKeywordRouter")
-            val natClz = Class.forName("dev.example.autoreply.ctwing.NativeHttp")
-            val facadeClz = Class.forName("dev.example.autoreply.ctwing.CtwingFacade")
-
-            // inferType
-            val inferType = routerClz.getDeclaredMethod("inferType", String::class.java)
-            inferType.isAccessible = true
-            val idType = inferType.invoke(null, iccid) as String
-
-            // pullTokenOrRebuild
-            val pullMethod = facadeClz.getDeclaredMethod("pullTokenOrRebuild")
-            val facadeObj = facadeClz.getDeclaredField("INSTANCE").get(null) as Any
-            pullMethod.invoke(facadeObj)
-
-            // getToken
-            val tokenField = natClz.getDeclaredField("cachedToken")
-            tokenField.isAccessible = true
-            val token = tokenField.get(null) as? String ?: ""
-
-            // 执行请求
-            val reqMethod = natClz.getDeclaredMethod(
-                when (op) {
-                    "query" -> "queryCard"
-                    "diagnose" -> "diagnose"
-                    "rebind" -> "operationCommit"
-                    else -> throw IllegalArgumentException("unknown op: $op")
-                },
-                String::class.java, String::class.java, String::class.java
-            )
-
-            val raw = if (op == "rebind") {
-                // 重绑需要 payload
-                val payload = org.json.JSONObject().apply {
-                    put("type", idType)
-                    put("id", iccid)
-                    put("imei", "")
-                    put("source", "其他")
-                    put("orderNumber", "")
-                    put("sessionId", "")
-                    put("comment", "")
-                    put("bindType", "")
-                    put("file", org.json.JSONObject().put("ids", org.json.JSONArray()))
-                    put("operation", "JKCB")
-                }.toString()
-                // operationCommit(token, payload)
-                val postMethod = natClz.getDeclaredMethod("operationCommit", String::class.java, String::class.java)
-                val facadeLock = facadeClz.getDeclaredField("webViewMutex").get(facadeObj)
-                val withLock = facadeLock.javaClass.getDeclaredMethod("withLock", Object::class.java)
-                // 简化：直接 NativeHttp POST
-                postMethod.invoke(null, token, payload) as String
-            } else {
-                reqMethod.invoke(null, token, idType, iccid) as String
-            }
-
-            // 格式化
-            val formatMethod = routerClz.getDeclaredMethod(
-                when (op) {
-                    "query" -> "formatCardInfo"
-                    "diagnose" -> "formatDiagnosis"
-                    else -> throw IllegalArgumentException("no format for $op")
-                },
-                String::class.java
-            )
-            formatMethod.isAccessible = true
-            formatMethod.invoke(null, raw) as String
-        }
-    }
-
-    private suspend fun forceRenew() {
-        withContext(Dispatchers.IO) {
-            val facadeClz = Class.forName("dev.example.autoreply.ctwing.CtwingFacade")
-            val facadeObj = facadeClz.getDeclaredField("INSTANCE").get(null) as Any
-            val forceRebuild = facadeClz.getDeclaredMethod("forceRebuild", Long::class.javaPrimitiveType)
-            forceRebuild.invoke(facadeObj, 40_000L)
-            val pullToken = facadeClz.getDeclaredMethod("pullToken")
-            pullToken.invoke(facadeObj)
-        }
-    }
-
-    private fun getToken(): String {
-        return runCatching {
-            val clz = Class.forName("dev.example.autoreply.ctwing.NativeHttp")
-            val f = clz.getDeclaredField("cachedToken")
-            f.isAccessible = true
-            f.get(null) as? String ?: ""
-        }.getOrDefault("")
     }
 
     // ---- 工具 ----
@@ -358,9 +390,8 @@ object WebAdminServer {
         for (pair in query.split("&")) {
             val eq = pair.indexOf("=")
             if (eq > 0) {
-                val k = URLDecoder.decode(pair.substring(0, eq), "UTF-8")
-                val v = URLDecoder.decode(pair.substring(eq + 1), "UTF-8")
-                map[k] = v
+                map[URLDecoder.decode(pair.substring(0, eq), "UTF-8")] =
+                    URLDecoder.decode(pair.substring(eq + 1), "UTF-8")
             }
         }
         return map
@@ -379,7 +410,7 @@ object WebAdminServer {
         return (1..32).map { chars.random() }.joinToString("")
     }
 
-    // ---- HTML 页面（内嵌） ----
+    // ---- HTML 页面 ----
 
     private val HTML = """
 <!DOCTYPE html>
@@ -501,7 +532,7 @@ function doOp(op) {
   if (!iccid) { toast('请先输入卡号'); return; }
   var el = document.getElementById('opResult');
   el.className = 'result info show';
-  el.textContent = '⏳ ' + ({query:'查询中',diagnose:'诊断中',rebind:'重绑中'}[op]) + '…';
+  el.textContent = ({query:'查询中',diagnose:'诊断中',rebind:'重绑中'})[op] + '...';
   fetch('/api/'+op, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'iccid='+encodeURIComponent(iccid) })
   .then(r=>r.json()).then(d=>{
     el.className = 'result ' + (d.ok ? 'ok' : 'err') + ' show';
@@ -514,13 +545,13 @@ function doRenew() {
   var btn = document.getElementById('btnRenew');
   btn.disabled = true;
   el.className = 'result info show';
-  el.textContent = '⏳ 正在强制刷新登录态（约 10 秒）…';
+  el.textContent = '正在强制刷新登录态（约 10 秒）...';
   fetch('/api/renew', { method:'POST' }).then(r=>r.json()).then(d=>{
     el.className = 'result ' + (d.ok && d.changed ? 'ok' : 'err') + ' show';
     if (d.ok && d.changed) {
-      el.textContent = '✅ 续期成功，token 已刷新\n旧: ' + d.oldToken.substring(0,12) + '…\n新: ' + d.newToken.substring(0,12) + '…';
+      el.textContent = '✅ 续期成功，token 已刷新\n旧: ' + d.oldToken.substring(0,12) + '...\n新: ' + d.newToken.substring(0,12) + '...';
     } else if (d.ok) {
-      el.textContent = '⚠️ 续期完成，但 token 未变化（可能登录态仍有效）';
+      el.textContent = '⚠️ 续期完成，但 token 未变化';
     } else {
       el.textContent = '❌ ' + d.msg;
     }

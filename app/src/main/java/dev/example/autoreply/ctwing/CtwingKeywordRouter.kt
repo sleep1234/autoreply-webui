@@ -462,7 +462,7 @@ object CtwingKeywordRouter {
      * 通用 NativeHttp GET 请求：自动处理 token 拉取 + 401 重建重试。
      * [request] 是具体请求闭包（queryCard / diagnose），返回 API 原始响应字符串。
      */
-    private suspend fun nativeGetWithRetry(
+    internal suspend fun nativeGetWithRetry(
         tag: String,
         request: (token: String) -> String,
     ): String? {
@@ -499,7 +499,7 @@ object CtwingKeywordRouter {
         s.isNotEmpty() && (s[0] == '\u001e' || s.contains("CTROBF"))
 
     /** Infer card id type: msisdn (1x 11-13 digits), imsi (15 digits), else iccid. */
-    private fun inferType(id: String): String {
+    internal fun inferType(id: String): String {
         var normalized = id
         if (normalized.length == 20 && normalized[0] == '8') normalized = normalized.substring(0, 19)
         return when {
@@ -514,7 +514,7 @@ object CtwingKeywordRouter {
      * 只匹配明确的错误场景（如"不在查询范围"），不拦截正常响应。
      * 返回 null 表示不是业务错误，继续正常解析。
      */
-    private fun extractQueryError(raw: String): String? {
+    internal fun extractQueryError(raw: String): String? {
         return try {
             val root = org.json.JSONObject(raw)
             val code = root.optInt("code", 0)
@@ -532,7 +532,7 @@ object CtwingKeywordRouter {
      * 永久错误 → 保留幂等记录，防止用户无意义重复提交。
      * 临时错误（网络/超时/401）→ 清除幂等，允许立刻重试。
      */
-    private fun isPermanentBusinessError(msg: String): Boolean {
+    internal fun isPermanentBusinessError(msg: String): Boolean {
         val lower = msg.lowercase()
         return lower.contains("不在") || lower.contains("范围") ||
             lower.contains("非台州") || lower.contains("权限") ||
@@ -546,7 +546,7 @@ object CtwingKeywordRouter {
      * Prefers a JSON response (200) whose body is an object/array; skips
      * the 403 anti-bot HTML page.
      */
-    private fun extractBestResponse(raw: String): String? {
+    internal fun extractBestResponse(raw: String): String? {
         return try {
             var json = raw.trim()
             if (json.startsWith("\"") && json.endsWith("\"")) {
@@ -581,7 +581,7 @@ object CtwingKeywordRouter {
         }
     }
 
-    private fun formatCardInfo(text: String): String {
+    internal fun formatCardInfo(text: String): String {
         if (isCiphertext(text)) return "⚠️ 返回密文（CTROBF1），尚未解密。"
         if (text.contains(" | ") && !text.trimStart().startsWith("{")) {
             val sb = StringBuilder("📱 卡信息\n")
@@ -746,7 +746,7 @@ object CtwingKeywordRouter {
         }
     }
 
-    private fun formatDiagnosis(json: String): String {
+    internal fun formatDiagnosis(json: String): String {
         XposedBridge.log("$TAG formatDiagnosis input(${json.length}): ${json.take(800)}")
         if (isCiphertext(json)) return "⚠️ 诊断结果返回密文，尚未解密。"
         return runCatching {
