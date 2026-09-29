@@ -36,6 +36,13 @@
 | 26 | **查询/诊断无命令空格的容错** | startsWith 要求精确格式 | contains 匹配 + 支持号码/命令词任意位置 |
 | 27 | **状态自检只是字符串判空** | 有 token 就报"正常"，实际可能已过期 | basicInfo 真实验证 + 过期自动续期 |
 | 28 | **查询/诊断/重绑 401 重试重复** | 三处各写一遍 forceRebuild 重试 | 提取 nativeGetWithRetry 通用函数（查询/诊断），重绑单独处理 |
+| 29 | **NativeHttp 自动重定向死循环** | token 为空时 CTWing 302→登录页→302，21 次后抛 Too many follow-up | instanceFollowRedirects=false，手动处理 401/3xx |
+| 30 | **forceRebuild 不换 token** | rebuildAndWait 二次检查跳过 OAuth，token 永远不变 | forceRebuild 改为 reloadOAuthOnPool，对现有 WebView 重走 OAuth 换新 token |
+| 31 | **死代码堆积** | formatRebind/awaitDeferred/queryBasicInfo/parseBindInfo/BindInfo 无调用 | 删除 ~80 行 |
+| 32 | **forceRebuild 递归风险** | reloadOAuthOnPool 内部 null 时调 forceRebuild，WebView 引用源不一致可致死循环 | 统一用 findForHost 判据，fallback 改为 rebuildAndWait 断环 |
+| 33 | **续期/状态不回显 token** | 只显示"成功"/"正常"，无法验证 token 真的变了 | 回显完整 token + 新旧对比 |
+| 34 | **无热更新拦截可观测性** | TinkerGuard 只打 log，面板看不到 | 拦截留痕记录 + 状态面板展示 |
+| 35 | **缺服务状态面板** | 状态只能靠聊天命令查看 | 微信"+"菜单新增「服务状态」入口，含真实验证+一键续期+热更新拦截卡片 |
 
 ---
 
@@ -60,6 +67,16 @@
 | rebuildMutex 单独 | TokenKeepAlive 等外部可单独获取 rebuildMutex |
 
 **禁止反向获取**（持有 rebuildMutex 时获取 webViewMutex），否则死锁。
+
+### Git 推送
+
+GitHub 直连频繁 `Connection reset`，必须走本地代理（Clash 7890 端口）：
+
+```bash
+git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push origin master
+```
+
+不要用 `http.proxy=`（空）——那是"绕过代理直连"，正是失败的原因。
 
 ---
 
@@ -111,18 +128,36 @@ finish MMWebViewUI 会暂停 WebView 渲染器 → pullToken 超时（evaluateJa
 moveTaskToBack 保持 Activity 存活、WebView 正常渲染。
 JEP：**偷取后必须用 moveTaskToBack，不能 finish。**
 
-### 2.7 每次 NativeHttp 请求前必须 pullToken
+### 2.7 每次 NativeHttp 请求前必须验证 token
 
 查询每次先 pullToken 再请求，正常工作。诊断漏了 pullToken，直接用 `NativeHttp.cachedToken`（可能是几十分钟前的旧值）→ 401"账号未登录"。
-JEP：**所有需要登录态的 NativeHttp GET 请求，必须先 `pullToken(cookie)` 刷新 token。不要假设 cachedToken 有效。**
+JEP：**所有需要登录态的 NativeHttp GET 请求，必须先确保 token 有效。不要假设 cachedToken 有效。**
 
-### 2.8 白名单存储路径跨包权限
+### 2.8 forceRebuild vs TokenKeepAlive.doRefresh 本质区别
+
+| | forceRebuild | doRefresh |
+|------|------|------|
+| 触发场景 | 命令 401 / 空 token / 续期命令 / 一键续期 | 定时（25min）/ 状态过期自愈 |
+| 策略 | **强制** reloadOAuthOnPool（对现有 WebView 重新 loadUrl OAuth） | **温和** onResume → 不行才重建 → basicInfo 兜底 |
+| token | 一定换新的 | 不一定（如果 OAuth 还没过期就复用旧 token） |
+| 代价 | ~10s | ~3s |
+
+核心坑：rebuildAndWait 有"二次检查"，发现 WebView 还在 web-apps/ 页面上就跳过 OAuth → pullToken 读到同一个旧 token。
+修复：forceRebuild 改为直接 reloadOAuthOnPool（对 WebView loadUrl OAuth），不走 rebuildAndWait 跳过。
+
+### 2.9 NativeHttp 禁用自动重定向
+
+`HttpURLConnection` 默认 `instanceFollowRedirects=true`，最多跟 20 次。
+token 为空时 CTWing 返回 302 → 登录页 → 302 … 死循环 21 次后抛 `Too many follow-up requests: 21`。
+修复：`instanceFollowRedirects=false`，手动判断 401/3xx 返回结构化错误。
+
+### 2.10 白名单存储路径跨包权限
 
 用 `createPackageContext("dev.example.autoreply")` 拿模块 filesDir → 代码跑在微信进程（UID 不同）→ 无写权限 → 保存静默失败（runCatching 吞异常）。
 正确做法：用微信 `lpparam.appInfo.dataDir` 下的子目录（如 `files/autoreply/`），每个微信实例各自独立。
 JEP：**Xposed 模块写文件只能用宿主进程有写权限的路径，不能跨包写。**
 
-### 2.9 白名单语义
+### 2.11 白名单语义
 
 - 空列表 = **不回复任何人**（所有消息被 skip）
 - 非空列表 = 只回复列表内的会话
@@ -130,7 +165,7 @@ JEP：**Xposed 模块写文件只能用宿主进程有写权限的路径，不�
 - "清空"按钮必须立即 `setList(emptyList())` 写文件，不能只清 Compose 内存状态
 - **无敌模式（紧急关闭）**：用 su 删掉 `autoreply_whitelist.json` 文件 → 空白名单不回复任何人
 
-### 2.10 群聊真实 @ 通知（参照 WeKit MentionMembers）
+### 2.12 群聊真实 @ 通知（参照 WeKit MentionMembers）
 
 微信的 @ 提醒靠消息 msgSource 里的 `<atuserlist>` 节点，不是 content 文本里的 "@昵称"。
 
@@ -208,22 +243,24 @@ rebuildAndWait:
 
 ---
 
-## 七、当前功能全景与运行逻辑（2026-09-28 版）
+## 七、当前功能全景与运行逻辑（2026-09-29 版）
 
 ### 7.1 功能清单
 
 | 功能 | 状态 |
 |------|------|
-| 查询（ICCID/接入号） | ✅ NativeHttp GET，401 自动重建 OAuth 重试 |
-| 诊断（ICCID/接入号） | ✅ NativeHttp GET，401 自动重建 OAuth 重试 |
+| 查询（ICCID/接入号） | ✅ NativeHttp GET，401/空 token 自动重建 OAuth 重试 |
+| 诊断（ICCID/接入号） | ✅ NativeHttp GET，401/空 token 自动重建 OAuth 重试 |
 | 重绑（ICCID/接入号/IMSI） | ✅ WebView XHR + NativeHttp fallback，30s 幂等防重复 |
 | 群聊 @ 发起者（真实通知） | ✅ AtMentionHook 注入 atuserlist |
 | 重绑回显卡号 | ✅ 结果末尾追加类型标签+号码 |
 | 命令容错 | ✅ contains 匹配 + 号码/命令词任意位置 + "解绑"别名 |
 | 重绑失败分类 | ✅ 永久业务错误保留幂等（不刷），临时/网络错误允许重试 |
-| 状态自检 | ✅ basicInfo 真实验证 token + 过期自动续期 |
-| 续期命令 | ✅ 调用 TokenKeepAlive 温和续期 |
+| 状态自检（聊天命令） | ✅ basicInfo 真实验证 token + 过期自动强制续期 + 回显 token |
+| 续期命令 | ✅ forceRebuild 强制走 OAuth 换新 token + 新旧 token 对比 |
 | 定时自动续期 | ✅ TokenKeepAlive 每 25 分钟（onResume/重建/basicInfo 三级） |
+| **服务状态面板** | ✅ 微信"+"菜单入口：真实验证 + token 展示 + 一键续期 + 热更新拦截卡片 |
+| 热更新拦截 | ✅ TinkerGuard 三层 + 拦截留痕可观测 |
 | 白名单 | ✅ 空=不回复，非空=只回复列表内 |
 | 后台静默 | ✅ NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack |
 | WebView 被杀自动恢复 | ✅ pullTokenOrRebuild + fireJs 兜底 + TokenKeepAlive 兜底 |
