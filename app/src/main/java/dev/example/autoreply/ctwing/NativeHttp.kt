@@ -81,7 +81,12 @@ object NativeHttp {
                 XposedBridge.log("$TAG GET $urlStr → $code redirect → $location")
                 return """{"code":$code,"msg":"redirect to $location"}"""
             }
-            val body = conn.inputStream.bufferedReader().readText()
+            val body = try {
+                conn.inputStream.bufferedReader().readText()
+            } catch (e: Exception) {
+                // 非 2xx 时 inputStream 抛 FileNotFoundException，从 errorStream 读
+                conn.errorStream?.bufferedReader()?.readText() ?: throw e
+            }
             XposedBridge.log("$TAG GET $urlStr → $code (${body.length}B) head: ${body.take(300)}")
             return body
         } catch (e: Exception) {

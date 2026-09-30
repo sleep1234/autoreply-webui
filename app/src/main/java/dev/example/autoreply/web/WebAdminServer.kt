@@ -183,6 +183,7 @@ object WebAdminServer {
         p == "/api/accounts/changepw" && m == "POST" -> auth(h) { sess -> accountsChangePw(sess, b) }
         p == "/api/accounts/resetpw" && m == "POST" -> auth(h) { sess -> accountsResetPw(sess, b) }
         p == "/api/selfcheck" && m == "POST" -> auth(h) { _ -> selfCheck() }
+        p == "/api/logout" && m == "POST" -> logout(h)
         else -> Triple(404, "text/plain", "Not Found")
     }
 
@@ -219,6 +220,14 @@ object WebAdminServer {
             put("role", acc.role)
         }
         return Triple(200, "application/json; charset=utf-8", json.toString())
+    }
+
+    /** 退出登录：删除 session。 */
+    private fun logout(h: Map<String, String>): Triple<Int, String, String> {
+        val tok = (h["cookie"] ?: "").split("; ")
+            .firstOrNull { it.startsWith("session=") }?.removePrefix("session=") ?: ""
+        sessions.remove(tok)
+        return Triple(200, "application/json; charset=utf-8", """{"ok":true}""")
     }
 
     // ---- CTWing API（复用窗口端函数） ----
@@ -296,9 +305,16 @@ object WebAdminServer {
     private suspend fun ocr(uploaded: ByteArray): Triple<Int, String, String> {
         if (uploaded.isEmpty()) return err("请上传图片")
         return try {
-            val iccid = withContext(Dispatchers.IO) { AgnesAiClient.extractIccid(uploaded) }
-            if (iccid != null) ok(iccid)
-            else err("未识别到 ICCID，请确认图片清晰且包含完整的 19-20 位卡号")
+            val cards = withContext(Dispatchers.IO) { AgnesAiClient.extractCards(uploaded) }
+            if (cards.isEmpty()) return err("未识别到卡号，请确认图片清晰且包含完整的卡号信息")
+            val json = org.json.JSONObject().apply {
+                put("ok", true)
+                put("cards", org.json.JSONArray(cards))
+                put("count", cards.size)
+                put("single", cards.size == 1)
+                if (cards.size == 1) put("result", cards[0])
+            }
+            Triple(200, "application/json; charset=utf-8", json.toString())
         } catch (e: Exception) { err("AI 识别失败: ${e.message}") }
     }
 
@@ -306,52 +322,56 @@ object WebAdminServer {
 
     private suspend fun selfCheck(): Triple<Int, String, String> {
         val testIccid = "8986032548200686692"
+        val idType = CtwingKeywordRouter.inferType(testIccid)
         return try {
             CtwingFacade.webViewMutex.withLock {
-                CtwingFacade.pullTokenOrRebuild()
+                // 1. WebView 存活检测
+                val webViewAlive = CtwingWebViewHook.currentWebView() != null
+
+                // 2. 查询：走 nativeGetWithRetry（自动 pullToken + 401 → forceRebuild → 重试）
+                val queryRaw = CtwingKeywordRouter.nativeGetWithRetry("web-selfcheck-query") { token ->
+                    NativeHttp.queryCard(token, idType, testIccid)
+                }
+
+                // 3. 诊断：同上
+                val diagRaw = CtwingKeywordRouter.nativeGetWithRetry("web-selfcheck-diag") { token ->
+                    NativeHttp.diagnose(token, idType, testIccid)
+                }
+
+                // 4. 拉最终 token 用于回显
+                CtwingFacade.pullToken()
                 val token = NativeHttp.cachedToken ?: ""
-                if (token.isBlank()) return@withLock Triple(200, "application/json; charset=utf-8",
-                    """{"ok":true,"status":"error","token":"","summary":"Token 为空，请先续期","queryResult":"未执行","diagnoseResult":"未执行"}""")
 
-                val idType = CtwingKeywordRouter.inferType(testIccid)
-
-                // 查询
-                val queryRaw = runCatching {
-                    withContext(Dispatchers.IO) { NativeHttp.queryCard(token, idType, testIccid) }
-                }.getOrElse { e -> "FAILED: ${e.message}" }
-
-                // 诊断
-                val diagRaw = runCatching {
-                    withContext(Dispatchers.IO) { NativeHttp.diagnose(token, idType, testIccid) }
-                }.getOrElse { e -> "FAILED: ${e.message}" }
-
-                val queryOk = queryRaw.contains("\"code\":0")
-                val diagOk = diagRaw.contains("\"code\":0")
+                val queryOk = queryRaw?.contains("\"code\":0") == true
+                val diagOk = diagRaw?.contains("\"code\":0") == true
                 val allOk = queryOk && diagOk
 
                 val summary = when {
-                    allOk -> "✅ Token 正常，查询和诊断均通过"
-                    queryOk -> "⚠️ 查询通过，诊断异常"
-                    diagOk -> "⚠️ 查询异常，诊断通过"
+                    !webViewAlive -> "⚠️ WebView 已丢失（会影响重绑），但 token 验证：${if (allOk) "通过" else "未通过"}"
+                    allOk -> "✅ WebView 存活，Token 正常，查询和诊断均通过"
+                    queryOk -> "✅ WebView 存活，但诊断异常"
+                    diagOk -> "✅ WebView 存活，但查询异常"
                     else -> "❌ Token 可能已失效，请续期"
                 }
 
                 val sb = StringBuilder()
                 sb.appendLine(summary)
+                sb.appendLine("· WebView：${if (webViewAlive) "✅ 存活" else "❌ 已丢失"}")
                 sb.appendLine("· Token：${token.take(12)}…（${token.length} 字符）")
                 sb.appendLine("· 查询：${if (queryOk) "✅ 通过" else "❌ 失败"}")
-                if (!queryOk) sb.appendLine("  ${queryRaw.take(120)}")
+                if (!queryOk) sb.appendLine("  ${(queryRaw ?: "null").take(120)}")
                 sb.appendLine("· 诊断：${if (diagOk) "✅ 通过" else "❌ 失败"}")
-                if (!diagOk) sb.appendLine("  ${diagRaw.take(120)}")
+                if (!diagOk) sb.appendLine("  ${(diagRaw ?: "null").take(120)}")
 
                 val json = org.json.JSONObject().apply {
                     put("ok", true)
                     put("status", if (allOk) "ok" else if (queryOk || diagOk) "partial" else "error")
+                    put("webViewAlive", webViewAlive)
                     put("token", token)
                     put("tokenLen", token.length)
                     put("summary", summary)
-                    put("queryResult", if (queryOk) "通过" else queryRaw.take(200))
-                    put("diagnoseResult", if (diagOk) "通过" else diagRaw.take(200))
+                    put("queryResult", if (queryOk) "通过" else (queryRaw ?: "null").take(200))
+                    put("diagnoseResult", if (diagOk) "通过" else (diagRaw ?: "null").take(200))
                     put("detail", sb.toString())
                 }
                 Triple(200, "application/json; charset=utf-8", json.toString())
@@ -489,7 +509,7 @@ object WebAdminServer {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>天翼物联一站式服务工具</title>
+<title>台州电信物联网卡小工具</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fa; color: #333; min-height: 100vh; }
@@ -555,26 +575,27 @@ object WebAdminServer {
 </div>
 <div class="container">
   <div class="header">
-    <h1>🛰️ 天翼物联一站式服务工具</h1>
+    <h1>📱 台州电信物联网卡小工具</h1>
     <div class="status" id="statusBar"><span>加载中...</span></div>
     <div style="margin-top:8px;font-size:12px;opacity:0.7;" id="userInfo"></div>
-    <div style="margin-top:8px;"><button class="btn btn-renew btn-sm" onclick="showAccountPanel()" style="background:rgba(255,255,255,0.25);color:white;">👤 账号管理</button></div>
+    <div style="margin-top:8px;display:flex;gap:8px;justify-content:center;">
+      <button class="btn btn-renew btn-sm" onclick="showAccountPanel()" style="background:rgba(255,255,255,0.25);color:white;">👤 账号管理</button>
+      <button class="btn btn-sm" onclick="doLogout()" style="background:rgba(255,255,255,0.15);color:white;">🚪 退出登录</button>
+    </div>
   </div>
 
   <div class="card">
-    <h2>🔑 一键续期</h2>
+    <h2>🩺 自检</h2>
     <div class="btn-row">
-      <button class="btn btn-renew" onclick="doRenew()" id="btnRenew">🔄 强制刷新登录态</button>
-      <button class="btn btn-query" onclick="doSelfCheck()" id="btnSelfCheck">🩺 自检 Token</button>
+      <button class="btn btn-query" onclick="doSelfCheck()" id="btnSelfCheck">🩺 自检 Token 与 WebView</button>
     </div>
-    <div class="result" id="renewResult"></div>
+    <div class="result" id="selfcheckResult"></div>
   </div>
 
   <div class="card">
     <h2>📋 物联卡操作</h2>
-    <input type="text" id="iccid" placeholder="输入 ICCID 或 接入号" onkeydown="if(event.key==='Enter')doQuery()">
+    <input type="text" id="iccid" placeholder="输入 ICCID 或 接入号" onkeydown="if(event.key==='Enter')doDiagnose()">
     <div class="btn-row">
-      <button class="btn btn-query" onclick="doQuery()">🔍 查询</button>
       <button class="btn btn-diag" onclick="doDiagnose()">🩺 诊断</button>
       <button class="btn btn-rebind" onclick="doRebind()">🔄 重绑</button>
     </div>
@@ -582,11 +603,21 @@ object WebAdminServer {
   </div>
 
   <div class="card">
+    <h2>📝 长文本提取</h2>
+    <textarea id="longText" rows="4" style="width:100%;padding:12px 14px;border:1.5px solid #e0e4ea;border-radius:10px;font-size:14px;outline:none;resize:vertical;font-family:inherit;" placeholder="粘贴一段长文本，自动提取其中的 ICCID（8986开头的19位数字）和接入号（1开头的13位数字）"></textarea>
+    <div class="btn-row">
+      <button class="btn btn-query" onclick="extractLongText()">🔍 提取卡号</button>
+      <button class="btn btn-sm btn-danger" onclick="clearExtractedList()">🗑 清空列表</button>
+    </div>
+    <div class="result" id="extractResult"></div>
+    <div id="cardList" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
     <h2>📷 AI 识图</h2>
     <input type="file" id="imageFile" accept="image/*" onchange="previewImage(this)" style="margin-bottom:8px;">
     <div class="btn-row">
-      <button class="btn btn-ocr" onclick="doOcr()">🤖 识别 ICCID</button>
-      <button class="btn btn-query btn-sm" onclick="fillFromOcr()">📋 填入查询</button>
+      <button class="btn btn-ocr" onclick="doOcr()">🤖 识别卡号</button>
     </div>
     <div class="result" id="ocrResult"></div>
   </div>
@@ -618,6 +649,16 @@ function login(){
   });
 }
 
+function doLogout(){
+  fetch('/api/logout',{method:'POST'}).then(function(){
+    document.cookie = 'session=; path=/; max-age=0';
+    sessionToken=''; username=''; role='';
+    document.getElementById('loginOverlay').style.display='flex';
+    document.getElementById('loginUser').value='';
+    document.getElementById('loginPw').value='';
+  });
+}
+
 function checkSession(){
   fetch('/api/status',{method:'POST'}).then(function(r){
     if(r.status===401) document.getElementById('loginOverlay').style.display='flex';
@@ -639,31 +680,18 @@ function doOp(op){
   var iccid=document.getElementById('iccid').value.trim();
   if(!iccid){ toast('请先输入卡号'); return; }
   var el=document.getElementById('opResult'); el.className='result info show';
-  el.textContent=({query:'查询中',diagnose:'诊断中',rebind:'重绑中'})[op]+'...';
+  el.textContent=({diagnose:'诊断中',rebind:'重绑中'})[op]+'...';
   fetch('/api/'+op,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'iccid='+encodeURIComponent(iccid)})
   .then(function(r){return r.json()}).then(function(d){
     el.className='result '+(d.ok?'ok':'err')+' show'; el.textContent=d.ok?d.result:d.msg;
   }).catch(function(e){ el.className='result err show'; el.textContent='请求失败: '+e.message; });
 }
-function doQuery(){ doOp('query'); }
 function doDiagnose(){ doOp('diagnose'); }
 function doRebind(){ doOp('rebind'); }
 
-function doRenew(){
-  var el=document.getElementById('renewResult'), btn=document.getElementById('btnRenew');
-  btn.disabled=true; el.className='result info show'; el.textContent='正在强制刷新（约 10 秒）...';
-  fetch('/api/renew',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
-    el.className='result '+(d.ok&&d.changed?'ok':'err')+' show';
-    if(d.ok&&d.changed) el.textContent='✅ 续期成功，token 已刷新\n旧: '+d.oldToken.substring(0,12)+'...\n新: '+d.newToken.substring(0,12)+'...';
-    else if(d.ok) el.textContent='⚠️ 续期完成，但 token 未变化';
-    else el.textContent='❌ '+d.msg;
-    loadStatus();
-  }).catch(function(e){ el.className='result err show'; el.textContent='请求失败: '+e.message; }).finally(function(){ btn.disabled=false; });
-}
-
 function doSelfCheck(){
-  var el=document.getElementById('renewResult'), btn=document.getElementById('btnSelfCheck');
-  btn.disabled=true; el.className='result info show'; el.textContent='正在自检 Token…\n（用真实卡号查询+诊断验证 token 可用性）';
+  var el=document.getElementById('selfcheckResult'), btn=document.getElementById('btnSelfCheck');
+  btn.disabled=true; el.className='result info show'; el.textContent='正在自检…\n（检测 WebView 存活 + 真实卡号验证 token）';
   fetch('/api/selfcheck',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
     if(d.status==='ok') el.className='result ok show';
     else if(d.status==='partial') el.className='result info show';
@@ -676,7 +704,6 @@ function doSelfCheck(){
 
 // ---- AI OCR ----
 
-var lastOcrIccid='';
 function doOcr(){
   var file=document.getElementById('imageFile').files[0];
   if(!file){ toast('请先选择图片'); return; }
@@ -684,15 +711,95 @@ function doOcr(){
   var formData=new FormData(); formData.append('image',file);
   fetch('/api/ocr',{method:'POST',body:formData})
   .then(function(r){return r.json()}).then(function(d){
-    if(d.ok){ lastOcrIccid=d.result; el.className='result ok show'; el.textContent='✅ 识别结果: '+d.result; }
-    else { el.className='result err show'; el.textContent='❌ '+d.msg; }
+    if(!d.ok){ el.className='result err show'; el.textContent='❌ '+d.msg; return; }
+    if(d.single){
+      // 单个卡号：自动填入输入框
+      var card = d.cards[0];
+      document.getElementById('iccid').value = card;
+      var label = (card.length===19 && card.startsWith('8986')) ? 'ICCID' : '接入号';
+      el.className='result ok show'; el.textContent='✅ 识别结果 (' + label + ')：' + card + '\n已自动填入输入框';
+    }else{
+      // 多个卡号：充入长文本提取列表
+      for(var i=0; i<d.cards.length; i++){
+        var c = d.cards[i];
+        var type = (c.length===19 && c.startsWith('8986')) ? 'iccid' : 'msisdn';
+        // 去重
+        if(!cardList.some(function(x){return x.text===c;})){
+          cardList.push({text:c, type:type});
+        }
+      }
+      renderCardList();
+      el.className='result ok show'; el.textContent='✅ 识别到 ' + d.cards.length + ' 个卡号，已充入下方「长文本提取」列表';
+    }
   }).catch(function(e){ el.className='result err show'; el.textContent='请求失败: '+e.message; });
 }
 
-function fillFromOcr(){
-  if(!lastOcrIccid){ toast('请先识别一张图片'); return; }
-  document.getElementById('iccid').value=lastOcrIccid;
-  toast('已填入: '+lastOcrIccid);
+// ---- 长文本提取 ----
+
+var cardList = []; // {text, type: 'iccid'|'msisdn'}
+
+function extractLongText(){
+  var text = document.getElementById('longText').value;
+  if(!text.trim()){ toast('请先粘贴文本'); return; }
+  cardList = [];
+  // ICCID: 8986 开头的连续数字，精确 19 位（中断则丢弃）
+  var iccidRe = /8986\d{15}(?!\d)/g;
+  // 接入号: 1 开头的连续数字，精确 13 位（中断则丢弃）
+  var msisdnRe = /1\d{12}(?!\d)/g;
+  var seen = {};
+  var m;
+  while((m = iccidRe.exec(text)) !== null){
+    var v = m[0];
+    if(!seen[v]){ seen[v]=true; cardList.push({text:v, type:'iccid'}); }
+  }
+  while((m = msisdnRe.exec(text)) !== null){
+    var v = m[0];
+    if(!seen[v]){ seen[v]=true; cardList.push({text:v, type:'msisdn'}); }
+  }
+  renderCardList();
+}
+
+function renderCardList(){
+  var el = document.getElementById('extractResult');
+  var listEl = document.getElementById('cardList');
+  if(cardList.length === 0){
+    el.className = 'result err show'; el.textContent = '未提取到有效 ICCID（8986+19位）或接入号（1+13位）';
+    listEl.innerHTML = '';
+    return;
+  }
+  el.className = 'result ok show';
+  el.textContent = '已提取 ' + cardList.length + ' 个卡号';
+  var html = '';
+  for(var i = 0; i < cardList.length; i++){
+    var c = cardList[i];
+    var label = c.type === 'iccid' ? 'ICCID' : '接入号';
+    html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-bottom:1px solid #e0e4ea;font-size:13px;">' +
+      '<span style="font-family:monospace;">' + c.text + '</span>' +
+      '<span style="font-size:11px;color:#999;">' + label + '</span>' +
+      '<span>' +
+      '<button class="btn btn-sm btn-query" onclick="fillCard(' + i + ')" style="margin-left:8px;">填入</button>' +
+      '<button class="btn btn-sm btn-danger" onclick="deleteCard(' + i + ')" style="margin-left:4px;">删除</button>' +
+      '</span></div>';
+  }
+  listEl.innerHTML = html;
+}
+
+function fillCard(idx){
+  document.getElementById('iccid').value = cardList[idx].text;
+  cardList.splice(idx, 1);
+  renderCardList();
+}
+
+function deleteCard(idx){
+  cardList.splice(idx, 1);
+  renderCardList();
+}
+
+function clearExtractedList(){
+  cardList = [];
+  document.getElementById('extractResult').className = 'result';
+  document.getElementById('cardList').innerHTML = '';
+  document.getElementById('longText').value = '';
 }
 
 function previewImage(input){

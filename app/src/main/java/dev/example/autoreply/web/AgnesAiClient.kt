@@ -19,23 +19,23 @@ object AgnesAiClient {
     private const val MODEL = "agnes-3.0-flash"
 
     private val SYSTEM_PROMPT = """
-你是物联卡信息识别助手。用户会给你一张物联卡图片，请从中提取 ICCID。
+你是物联卡信息识别助手。用户会给你一张物联卡图片，请从中提取所有卡号。
 
-ICCID 规则：通常是 19 位或 20 位数字，常以 8986 开头（中国电信/联通物联卡）。
-
-要求：
-1. 只输出你识别到的 ICCID 纯数字，不要任何其他文字、标点、空格或换行。
-2. 如果图中没有 ICCID，输出 "NOT_FOUND"。
-3. 如果图片模糊无法确定，输出 "NOT_FOUND"。
-4. 如果识别到多个候选，只输出最完整、最像 ICCID 的那个（20位优先，19位次之）。
+识别规则：
+1. ICCID：8986 开头的 19 位连续数字（若中断则丢弃，不要截取 20 位数字的前 19 位）。
+2. 接入号：1 开头的 13 位连续数字（若中断则丢弃）。
+3. 输出格式：把识别到的每个卡号单独放一行，只输出纯数字，不要任何其他文字、标点、空格或换行外的内容。
+4. 如果图中没有卡号，只输出 "NOT_FOUND"。
+5. 如果识别到多个卡号，每个占一行，按在原图出现的顺序输出。
+6. 重复出现的同一卡号只输出一次。
 """.trimIndent()
 
     /**
-     * 识别图片中的 ICCID。
+     * 识别图片中的卡号（ICCID 或接入号）。
      * @param imageBytes 图片原始字节（PNG/JPEG）
-     * @return 识别到的 ICCID（纯数字），失败返回 null
+     * @return 识别到的卡号列表（去重），失败或未识别返回空列表
      */
-    fun extractIccid(imageBytes: ByteArray): String? {
+    fun extractCards(imageBytes: ByteArray): List<String> {
         return try {
             val b64 = Base64.getEncoder().encodeToString(imageBytes)
             val mime = detectMime(imageBytes)
@@ -43,7 +43,7 @@ ICCID 规则：通常是 19 位或 20 位数字，常以 8986 开头（中国电
 
             val body = org.json.JSONObject().apply {
                 put("model", MODEL)
-                put("max_tokens", 64)
+                put("max_tokens", 200)
                 put("messages", org.json.JSONArray().apply {
                     put(org.json.JSONObject().apply {
                         put("role", "system")
@@ -54,7 +54,7 @@ ICCID 规则：通常是 19 位或 20 位数字，常以 8986 开头（中国电
                         put("content", org.json.JSONArray().apply {
                             put(org.json.JSONObject().apply {
                                 put("type", "text")
-                                put("text", "请识别这张物联卡图片中的 ICCID。")
+                                put("text", "请识别这张物联卡图片中的所有 ICCID 和接入号。")
                             })
                             put(org.json.JSONObject().apply {
                                 put("type", "image_url")
@@ -75,22 +75,27 @@ ICCID 规则：通常是 19 位或 20 位数字，常以 8986 开头（中国电
                 .getJSONObject("message")
                 .optString("content", "").trim()
 
-            XposedBridge.log("$TAG raw response content: ${content.take(80)}")
+            XposedBridge.log("$TAG raw response content: ${content.take(120)}")
 
-            when {
-                content.equals("NOT_FOUND", ignoreCase = true) -> null
-                else -> {
-                    // 提取纯数字
-                    val digits = content.filter { it.isDigit() }
-                    // ICCID 19-20 位
-                    if (digits.length in 19..20) digits else null
+            if (content.equals("NOT_FOUND", ignoreCase = true)) return emptyList()
+
+            // 按行解析，每行一个卡号，过滤非法格式
+            content.lines()
+                .map { it.trim().filter { c -> c.isDigit() } }
+                .filter { digits ->
+                    // ICCID: 8986 开头 19 位；接入号: 1 开头 13 位
+                    (digits.startsWith("8986") && digits.length == 19) ||
+                        (digits.startsWith("1") && digits.length == 13)
                 }
-            }
+                .distinct()
         } catch (e: Exception) {
-            XposedBridge.log("$TAG extractIccid failed: ${e.message}")
-            null
+            XposedBridge.log("$TAG extractCards failed: ${e.message}")
+            emptyList()
         }
     }
+
+    /** 兼容旧调用：返回单个 ICCID（多个时取第一个）。 */
+    fun extractIccid(imageBytes: ByteArray): String? = extractCards(imageBytes).firstOrNull()
 
     private fun post(body: String): String {
         val conn = (URL(API_URL).openConnection() as HttpURLConnection).apply {
