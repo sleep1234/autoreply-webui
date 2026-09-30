@@ -36,6 +36,11 @@ object CtwingFacade {
     /** 重建互斥锁：防止 pullTokenOrRebuild 与 TokenKeepAlive 并发重建，导致多窗口叠加。 */
     private val rebuildMutex = Mutex()
 
+    /** 上一次成功 pullToken 的时间戳（毫秒），10 分钟内跳过重新读取 WebView。 */
+    @Volatile
+    private var lastTokenPullAt = 0L
+    private const val TOKEN_CACHE_TTL_MS = 10 * 60 * 1000L  // 10 minutes
+
     // ------------------------------------------------------------------
     //  callJs — dispatches via local WebView or IPC
     // ------------------------------------------------------------------
@@ -122,6 +127,12 @@ object CtwingFacade {
      * in X5 sandbox). Returns true if token was captured.
      */
     suspend fun pullToken(): Boolean {
+        // 缓存时效：10 分钟内刚拉过且缓存有效，直接返回，避免频繁 evaluateJavascript IPC
+        val cached = NativeHttp.cachedToken
+        if (cached != null && cached.isNotBlank() &&
+            (System.currentTimeMillis() - lastTokenPullAt) < TOKEN_CACHE_TTL_MS) {
+            return true
+        }
         return try {
             val obj = pullTokenRaw() ?: return false
             val token = obj.optString("token", "")
@@ -129,6 +140,7 @@ object CtwingFacade {
             val cookie = obj.optString("cookie", "")
             if (token.isNotBlank()) {
                 NativeHttp.cachedToken = token
+                lastTokenPullAt = System.currentTimeMillis()
                 XposedBridge.log("$TAG pullToken: token captured (${token.length} chars)")
             } else {
                 // token 为空但旧缓存可能有效：WebView 刚 reload OAuth 时 SPA 未就绪会读不到 cookie。
@@ -245,13 +257,17 @@ object CtwingFacade {
         // 重绑 401 重试用的是 NativeHttp POST（不依赖 WebView XHR），
         // 只需要新鲜 token，不需要新鲜 H5。
         val wv = CtwingWebViewHook.findForHost("tywlonestop.ctwing.cn")
-        if (wv != null) {
+        val ok = if (wv != null) {
             XposedBridge.log("$TAG forceRebuild: reload OAuth on existing WebView")
             reloadOAuthOnPool(wv)
             kotlinx.coroutines.delay(8_000L)
-            return true
+            true
+        } else {
+            rebuildAndWait(timeoutMs)
         }
-        return rebuildAndWait(timeoutMs)
+        // 重置 token 缓存时间戳，强制下次 pullToken 从 WebView 重读新 token
+        lastTokenPullAt = 0L
+        return ok
     }
 
     /**

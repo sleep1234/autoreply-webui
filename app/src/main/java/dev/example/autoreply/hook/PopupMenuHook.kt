@@ -22,6 +22,7 @@ object PopupMenuHook {
     @Volatile private var handleClickDeclaringClass: Class<*>? = null
     @Volatile private var menuItemId = 0x7F000001
     @Volatile private var statusMenuItemId = 0x7F000002
+    @Volatile private var tunnelMenuItemId = 0x7F000003
     @Volatile private var installed = false
 
     fun init(classLoader: ClassLoader) {
@@ -165,6 +166,10 @@ object PopupMenuHook {
                 statusMenuItemId, "服务状态", "", android.R.drawable.ic_menu_info_details, 0
             ) ?: run { XposedBridge.log("$TAG statusItemDataCtor 失败"); return }
 
+            val tunnelItemData = itemDataCtor?.newInstance(
+                tunnelMenuItemId, "内网穿透", "", android.R.drawable.ic_menu_manage, 0
+            ) ?: run { XposedBridge.log("$TAG tunnelItemDataCtor 失败"); return }
+
             // 把 itemData 包装成 wrapper 类型（SparseArray 存的是 wrapper，不是 data）
             val wrapper: Any = if (wrapperClass != null && wrapperClass != itemData.javaClass) {
                 val ctor = wrapperClass.declaredConstructors.firstOrNull { it.parameterTypes.size == 1 }
@@ -178,8 +183,16 @@ object PopupMenuHook {
                 ctor?.newInstance(statusItemData) ?: statusItemData
             } else statusItemData
 
+            val tunnelWrapper: Any = if (wrapperClass != null && wrapperClass != tunnelItemData.javaClass) {
+                val ctor = wrapperClass.declaredConstructors.firstOrNull { it.parameterTypes.size == 1 }
+                    ?.apply { isAccessible = true }
+                ctor?.newInstance(tunnelItemData) ?: tunnelItemData
+            } else tunnelItemData
+
             @Suppress("UNCHECKED_CAST")
             (items as SparseArray<Any>).put(items.size(), wrapper)
+            @Suppress("UNCHECKED_CAST")
+            (items as SparseArray<Any>).put(items.size(), tunnelWrapper)
             @Suppress("UNCHECKED_CAST")
             (items as SparseArray<Any>).put(items.size(), statusWrapper)
             adapter?.notifyDataSetChanged()
@@ -224,6 +237,14 @@ object PopupMenuHook {
                 }
                 XposedBridge.log("$TAG 点击了服务状态菜单")
             }
+            if (id == tunnelMenuItemId) {
+                param.result = null
+                val activity = getCurrentActivity() ?: return
+                activity.runOnUiThread {
+                    TunnelLauncher.showTunnelPanel(activity)
+                }
+                XposedBridge.log("$TAG 点击了内网穿透菜单")
+            }
         } catch (e: Exception) {
             XposedBridge.log("$TAG interceptClick 失败: ${e.message}")
         }
@@ -234,13 +255,13 @@ object PopupMenuHook {
             f.isAccessible = true
             if (f.type == Int::class.java || f.type == Int::class.javaPrimitiveType) {
                 val v = f.get(obj)
-                if (v is Int && (v == menuItemId || v == statusMenuItemId)) return v
+                if (v is Int && (v == menuItemId || v == statusMenuItemId || v == tunnelMenuItemId)) return v
             }
             // 递归一层（wrapper -> data）
             if (!f.type.isPrimitive && !f.type.name.startsWith("java.")) {
                 val inner = runCatching { f.get(obj) }.getOrNull() ?: continue
                 val id = extractId(inner)
-                if (id == menuItemId || id == statusMenuItemId) return id
+                if (id == menuItemId || id == statusMenuItemId || id == tunnelMenuItemId) return id
             }
         }
         return -1

@@ -11,6 +11,7 @@ import androidx.compose.ui.unit.sp
 import dev.example.autoreply.ctwing.CtwingFacade
 import dev.example.autoreply.ctwing.CtwingWebViewHook
 import dev.example.autoreply.ctwing.NativeHttp
+import dev.example.autoreply.tunnel.TunnelManager
 import dev.example.autoreply.hook.TinkerGuard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -109,6 +110,17 @@ fun StatusScreen(
                     Spacer(Modifier.height(8.dp))
                     val wlState = if (whitelistEmpty) "未启用（不回复任何人）" else "已启用（${whitelistCount} 个会话）"
                     StatusRow("白名单", wlState)
+
+                    Spacer(Modifier.height(8.dp))
+                    val tunnel = TunnelManager.status()
+                    val tunnelEnabled = tunnel["enabled"] as? Boolean ?: false
+                    val tunnelRunning = tunnel["running"] as? Boolean ?: false
+                    val tunnelState = when {
+                        !tunnelEnabled -> "未启用"
+                        tunnelRunning -> "✅ 已连接（远程端口 ${tunnel["remotePort"]}）"
+                        else -> "🔴 未连接"
+                    }
+                    StatusRow("内网穿透", tunnelState)
                 }
             }
 

@@ -12,6 +12,7 @@ import dev.example.autoreply.ctwing.CtwingIpcBridge
 import dev.example.autoreply.ctwing.CtwingKeywordRouter
 import dev.example.autoreply.ctwing.CtwingNetworkHook
 import dev.example.autoreply.ctwing.CtwingWebViewHook
+import dev.example.autoreply.tunnel.TunnelManager
 import dev.example.autoreply.trigger.BufferedMessageTrigger
 import dev.example.autoreply.trigger.MessageTrigger
 import dev.example.autoreply.ui.WhitelistStore
@@ -96,6 +97,10 @@ class MainHook : IXposedHookZygoteInit, IXposedHookLoadPackage {
         // ---- Web 管理后台 ----
         WebAdminServer.start(lpparam.appInfo.dataDir, 60080)
         XposedBridge.log("[AutoReply] WebAdmin server started on port 60080")
+
+        // ---- 内网穿透隧道（纯 Socket 反向 TCP，SOCKS-free） ----
+        TunnelManager.init(lpparam.appInfo.dataDir)
+        XposedBridge.log("[AutoReply] TunnelManager init done")
 
         // ---- WeChat message capture + send ----
         val hook = WeChatHook(lpparam.classLoader)

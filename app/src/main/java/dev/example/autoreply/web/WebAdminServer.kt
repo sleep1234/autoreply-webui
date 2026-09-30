@@ -5,6 +5,7 @@ import dev.example.autoreply.ctwing.CtwingFacade
 import dev.example.autoreply.ctwing.CtwingKeywordRouter
 import dev.example.autoreply.ctwing.CtwingWebViewHook
 import dev.example.autoreply.ctwing.NativeHttp
+import dev.example.autoreply.tunnel.TunnelManager
 import dev.example.autoreply.hook.TinkerGuard
 import dev.example.autoreply.ui.WhitelistStore
 import kotlinx.coroutines.*
@@ -189,8 +190,16 @@ object WebAdminServer {
 
     // session → auth block
     private fun verifySession(h: Map<String, String>): SessionInfo? {
-        val tok = (h["cookie"] ?: "").split("; ")
-            .firstOrNull { it.startsWith("session=") }?.removePrefix("session=") ?: return null
+        // 优先读 Authorization 头（绕过 WebView cookie 传递不可靠问题）
+        val authHeader = h["authorization"] ?: ""
+        val tok = when {
+            authHeader.startsWith("Bearer ") -> authHeader.removePrefix("Bearer ").trim()
+            authHeader.startsWith("session ") -> authHeader.removePrefix("session ").trim()
+            authHeader.isNotBlank() -> authHeader.trim()
+            else -> (h["cookie"] ?: "").split("; ")
+                .firstOrNull { it.startsWith("session=") }?.removePrefix("session=") ?: return null
+        }
+        if (tok.isEmpty()) return null
         val si = sessions[tok] ?: return null
         if (System.currentTimeMillis() - si.createdAt > SESSION_TTL_MS) { sessions.remove(tok); return null }
         return si
@@ -233,10 +242,12 @@ object WebAdminServer {
     // ---- CTWing API（复用窗口端函数） ----
 
     private fun status(): Triple<Int, String, String> {
+        val tunnel = TunnelManager.status()
         val j = org.json.JSONObject().apply {
             put("ok", true); put("webViewAlive", CtwingWebViewHook.currentWebView() != null)
             put("token", NativeHttp.cachedToken ?: ""); put("tokenLen", (NativeHttp.cachedToken ?: "").length)
             put("whitelistCount", WhitelistStore.list().size); put("tinkerSummary", TinkerGuard.statusSummary())
+            put("tunnelRunning", tunnel["running"]); put("tunnelRemotePort", tunnel["remotePort"])
         }
         return Triple(200, "application/json; charset=utf-8", j.toString())
     }
@@ -538,7 +549,8 @@ object WebAdminServer {
   .result.ok { background: #e6f4ea; color: #137333; }
   .result.err { background: #fce8e6; color: #c5221f; }
   .result.info { background: #e8f0fe; color: #1967d2; }
-  .login-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
+  .login-overlay { display: none; position: fixed; inset: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); z-index: 100; align-items: center; justify-content: center; }
+  .login-overlay.show { display: flex; }
   .login-box { background: white; border-radius: 16px; padding: 30px; width: 340px; box-shadow: 0 10px 40px rgba(0,0,0,0.15); }
   .login-box h2 { font-size: 18px; margin-bottom: 18px; }
   .login-box label { font-size: 13px; color: #666; margin-bottom: 4px; display: block; margin-top: 10px; }
@@ -549,6 +561,8 @@ object WebAdminServer {
   .tab-content.active { display: block; }
   .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #333; color: white; padding: 10px 20px; border-radius: 8px; font-size: 13px; z-index: 200; display: none; }
   .toast.show { display: block; }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #e0e4ea; border-top-color: #667eea; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th,td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #e0e4ea; }
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 150; display: none; }
@@ -569,6 +583,7 @@ object WebAdminServer {
     <div class="result err" id="loginError"></div>
   </div>
 </div>
+<div id="mainPage" style="display:none;">
 <div class="toast" id="toast"></div>
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal-box" id="modalContent"></div>
@@ -622,14 +637,45 @@ object WebAdminServer {
     <div class="result" id="ocrResult"></div>
   </div>
 </div>
+</div>
 
 <script>
 var sessionToken='', username='', role='';
+
+// 包装 fetch：自动给 API 请求加 Authorization 头（绕开 WebView cookie 传递不可靠）
+(function(){
+  var _f = window.fetch;
+  window.fetch = function(url, opts){
+    opts = opts || {};
+    if(url.indexOf('/api/') === 0 && sessionToken){
+      opts.headers = opts.headers || {};
+      if(opts.headers instanceof Headers){
+        if(!opts.headers.has('Authorization')) opts.headers.set('Authorization', 'Bearer ' + sessionToken);
+      } else {
+        var h = {};
+        for(var k in opts.headers) h[k.toLowerCase()] = opts.headers[k];
+        if(!h['authorization']) opts.headers['Authorization'] = 'Bearer ' + sessionToken;
+      }
+    }
+    return _f.apply(this, arguments);
+  };
+})();
+
 (function init(){
   var c=document.cookie.split('; ').find(function(r){return r.startsWith('session=')});
   if(c){ sessionToken=c.split('=')[1]; checkSession(); }
-  else document.getElementById('loginOverlay').style.display='flex';
+  else showLogin();
 })();
+
+function showLogin(){
+  document.getElementById('loginOverlay').classList.add('show');
+  document.getElementById('mainPage').style.display='none';
+}
+
+function showMain(){
+  document.getElementById('loginOverlay').classList.remove('show');
+  document.getElementById('mainPage').style.display='block';
+}
 
 function login(){
   var user=document.getElementById('loginUser').value.trim();
@@ -640,8 +686,8 @@ function login(){
     if(d.ok){
       sessionToken=d.token; username=d.username; role=d.role;
       document.cookie='session='+d.token+'; path=/; max-age=3600';
-      document.getElementById('loginOverlay').style.display='none';
       document.getElementById('loginError').className='result';
+      showMain();
       loadStatus();
     }else{
       var e=document.getElementById('loginError'); e.textContent=d.msg; e.className='result err show';
@@ -653,17 +699,17 @@ function doLogout(){
   fetch('/api/logout',{method:'POST'}).then(function(){
     document.cookie = 'session=; path=/; max-age=0';
     sessionToken=''; username=''; role='';
-    document.getElementById('loginOverlay').style.display='flex';
     document.getElementById('loginUser').value='';
     document.getElementById('loginPw').value='';
+    showLogin();
   });
 }
 
 function checkSession(){
   fetch('/api/status',{method:'POST'}).then(function(r){
-    if(r.status===401) document.getElementById('loginOverlay').style.display='flex';
+    if(r.status===401){ showLogin(); }
     else return r.json();
-  }).then(function(d){ if(d&&d.ok) loadStatus(); }).catch(function(){});
+  }).then(function(d){ if(d&&d.ok){ showMain(); loadStatus(); } }).catch(function(){});
 }
 
 function loadStatus(){
@@ -674,13 +720,20 @@ function loadStatus(){
   }).catch(function(){});
 }
 
+// ---- loading 动画 ----
+
+function showSpinner(el, text){
+  el.className='result info show';
+  el.innerHTML='<span class="spinner"></span>' + text;
+}
+
 // ---- CTWing ops ----
 
 function doOp(op){
   var iccid=document.getElementById('iccid').value.trim();
   if(!iccid){ toast('请先输入卡号'); return; }
-  var el=document.getElementById('opResult'); el.className='result info show';
-  el.textContent=({diagnose:'诊断中',rebind:'重绑中'})[op]+'...';
+  var el=document.getElementById('opResult');
+  showSpinner(el, ({diagnose:'正在诊断…',rebind:'正在提交重绑…'})[op]);
   fetch('/api/'+op,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'iccid='+encodeURIComponent(iccid)})
   .then(function(r){return r.json()}).then(function(d){
     el.className='result '+(d.ok?'ok':'err')+' show'; el.textContent=d.ok?d.result:d.msg;
@@ -691,7 +744,7 @@ function doRebind(){ doOp('rebind'); }
 
 function doSelfCheck(){
   var el=document.getElementById('selfcheckResult'), btn=document.getElementById('btnSelfCheck');
-  btn.disabled=true; el.className='result info show'; el.textContent='正在自检…\n（检测 WebView 存活 + 真实卡号验证 token）';
+  btn.disabled=true; showSpinner(el, '正在自检…（检测 WebView + 验证 token）');
   fetch('/api/selfcheck',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
     if(d.status==='ok') el.className='result ok show';
     else if(d.status==='partial') el.className='result info show';
@@ -707,7 +760,8 @@ function doSelfCheck(){
 function doOcr(){
   var file=document.getElementById('imageFile').files[0];
   if(!file){ toast('请先选择图片'); return; }
-  var el=document.getElementById('ocrResult'); el.className='result info show'; el.textContent='正在 AI 识别...';
+  var el=document.getElementById('ocrResult');
+  showSpinner(el, '正在 AI 识别…');
   var formData=new FormData(); formData.append('image',file);
   fetch('/api/ocr',{method:'POST',body:formData})
   .then(function(r){return r.json()}).then(function(d){
