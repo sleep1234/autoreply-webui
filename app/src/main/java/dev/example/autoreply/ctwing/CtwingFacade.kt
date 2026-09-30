@@ -131,9 +131,9 @@ object CtwingFacade {
                 NativeHttp.cachedToken = token
                 XposedBridge.log("$TAG pullToken: token captured (${token.length} chars)")
             } else {
-                // token 为空：说明 WebView 登录态已失效，清掉旧 token 避免误用
-                NativeHttp.cachedToken = null
-                XposedBridge.log("$TAG pullToken: empty token, cleared cachedToken")
+                // token 为空但旧缓存可能有效：WebView 刚 reload OAuth 时 SPA 未就绪会读不到 cookie。
+                // 不清空旧缓存——如果旧 token 已过期，NativeHttp 会收到 401 并由 nativeGetWithRetry 兜底重建。
+                XposedBridge.log("$TAG pullToken: empty token from WebView (keeping cached if any)")
             }
             if (bond.isNotBlank()) {
                 NativeHttp.cachedBond = bond

@@ -77,10 +77,12 @@ object WebAdminServer {
     private suspend fun handle(socket: Socket) {
         try {
             socket.soTimeout = 30_000
-            val rawInput = socket.getInputStream()
-            val input = BufferedReader(InputStreamReader(rawInput, Charsets.ISO_8859_1))
+            val rawInput = BufferedInputStream(socket.getInputStream())
             val output = socket.getOutputStream()
-            val reqLine = input.readLine() ?: return
+
+            // 手动按字节读请求行（避免 BufferedReader 缓冲预读吞掉 body）
+            val reqLineBytes = readLineBytes(rawInput) ?: return
+            val reqLine = String(reqLineBytes, Charsets.ISO_8859_1)
             XposedBridge.log("$TAG 请求: $reqLine")
             val parts = reqLine.split(" "); if (parts.size < 2) return
             val method = parts[0]; val rawPath = parts[1]
@@ -90,7 +92,9 @@ object WebAdminServer {
             var contentLength = 0
             var contentType = ""
             while (true) {
-                val l = input.readLine() ?: break; if (l.isEmpty()) break
+                val lb = readLineBytes(rawInput) ?: break
+                if (lb.isEmpty()) break
+                val l = String(lb, Charsets.ISO_8859_1)
                 val c = l.indexOf(": "); if (c <= 0) continue
                 val k = l.substring(0, c).lowercase()
                 headers[k] = l.substring(c + 2)
@@ -98,7 +102,7 @@ object WebAdminServer {
                 if (k == "content-type") contentType = l.substring(c + 2)
             }
 
-            // 用底层 InputStream 读原始字节（避免 BufferedReader 的 char 转换破坏二进制）
+            // 读原始 body 字节（同一 BufferedInputStream，无缓冲冲突）
             val bodyBytes = if (contentLength > 0) {
                 val b = ByteArray(contentLength)
                 var total = 0
@@ -110,8 +114,6 @@ object WebAdminServer {
                 b.copyOf(total)
             } else ByteArray(0)
 
-            // 替换 readLine + read 为正确的双向流处理
-            // 重新实现：不用 BufferedReader.read，改用底层 InputStream
             val qi = rawPath.indexOf("?"); val path = if (qi >= 0) rawPath.substring(0, qi) else rawPath
             val qs = if (qi >= 0) rawPath.substring(qi + 1) else ""
 
@@ -135,8 +137,27 @@ object WebAdminServer {
             output.write(head); output.write(respBytes); output.flush()
             runCatching { socket.shutdownOutput() }
             XposedBridge.log("$TAG 响应: $code (${respBytes.size}B)")
-        } catch (_: Exception) {}
-        finally { try { Thread.sleep(200) } catch (_: Exception) {}; runCatching { socket.close() } }
+        } catch (e: Exception) {
+            XposedBridge.log("$TAG handle error: ${e.message}")
+        } finally {
+            try { Thread.sleep(200) } catch (_: Exception) {}
+            runCatching { socket.close() }
+        }
+    }
+
+    /** 从 InputStream 逐字节读取一行（以 \n 结尾，去掉尾部 \r），不预读多余字节。 */
+    private fun readLineBytes(input: InputStream): ByteArray? {
+        val buf = ByteArrayOutputStream()
+        while (true) {
+            val b = input.read()
+            if (b == -1) return if (buf.size() == 0) null else buf.toByteArray()
+            if (b == '\n'.code) {
+                val arr = buf.toByteArray()
+                // 去掉尾部 \r
+                return if (arr.isNotEmpty() && arr.last() == '\r'.code.toByte()) arr.copyOf(arr.size - 1) else arr
+            }
+            buf.write(b)
+        }
     }
 
     // ---- 路由 ----
@@ -161,6 +182,7 @@ object WebAdminServer {
         p == "/api/accounts/delete" && m == "POST" -> auth(h) { sess -> accountsDelete(sess, b) }
         p == "/api/accounts/changepw" && m == "POST" -> auth(h) { sess -> accountsChangePw(sess, b) }
         p == "/api/accounts/resetpw" && m == "POST" -> auth(h) { sess -> accountsResetPw(sess, b) }
+        p == "/api/selfcheck" && m == "POST" -> auth(h) { _ -> selfCheck() }
         else -> Triple(404, "text/plain", "Not Found")
     }
 
@@ -278,6 +300,70 @@ object WebAdminServer {
             if (iccid != null) ok(iccid)
             else err("未识别到 ICCID，请确认图片清晰且包含完整的 19-20 位卡号")
         } catch (e: Exception) { err("AI 识别失败: ${e.message}") }
+    }
+
+    // ---- 自检：用真实 token 发查询 + 诊断，验证 token 实际可用 ----
+
+    private suspend fun selfCheck(): Triple<Int, String, String> {
+        val testIccid = "8986032548200686692"
+        return try {
+            CtwingFacade.webViewMutex.withLock {
+                CtwingFacade.pullTokenOrRebuild()
+                val token = NativeHttp.cachedToken ?: ""
+                if (token.isBlank()) return@withLock Triple(200, "application/json; charset=utf-8",
+                    """{"ok":true,"status":"error","token":"","summary":"Token 为空，请先续期","queryResult":"未执行","diagnoseResult":"未执行"}""")
+
+                val idType = CtwingKeywordRouter.inferType(testIccid)
+
+                // 查询
+                val queryRaw = runCatching {
+                    withContext(Dispatchers.IO) { NativeHttp.queryCard(token, idType, testIccid) }
+                }.getOrElse { e -> "FAILED: ${e.message}" }
+
+                // 诊断
+                val diagRaw = runCatching {
+                    withContext(Dispatchers.IO) { NativeHttp.diagnose(token, idType, testIccid) }
+                }.getOrElse { e -> "FAILED: ${e.message}" }
+
+                val queryOk = queryRaw.contains("\"code\":0")
+                val diagOk = diagRaw.contains("\"code\":0")
+                val allOk = queryOk && diagOk
+
+                val summary = when {
+                    allOk -> "✅ Token 正常，查询和诊断均通过"
+                    queryOk -> "⚠️ 查询通过，诊断异常"
+                    diagOk -> "⚠️ 查询异常，诊断通过"
+                    else -> "❌ Token 可能已失效，请续期"
+                }
+
+                val sb = StringBuilder()
+                sb.appendLine(summary)
+                sb.appendLine("· Token：${token.take(12)}…（${token.length} 字符）")
+                sb.appendLine("· 查询：${if (queryOk) "✅ 通过" else "❌ 失败"}")
+                if (!queryOk) sb.appendLine("  ${queryRaw.take(120)}")
+                sb.appendLine("· 诊断：${if (diagOk) "✅ 通过" else "❌ 失败"}")
+                if (!diagOk) sb.appendLine("  ${diagRaw.take(120)}")
+
+                val json = org.json.JSONObject().apply {
+                    put("ok", true)
+                    put("status", if (allOk) "ok" else if (queryOk || diagOk) "partial" else "error")
+                    put("token", token)
+                    put("tokenLen", token.length)
+                    put("summary", summary)
+                    put("queryResult", if (queryOk) "通过" else queryRaw.take(200))
+                    put("diagnoseResult", if (diagOk) "通过" else diagRaw.take(200))
+                    put("detail", sb.toString())
+                }
+                Triple(200, "application/json; charset=utf-8", json.toString())
+            }
+        } catch (e: Exception) {
+            val json = org.json.JSONObject().apply {
+                put("ok", true)
+                put("status", "error")
+                put("summary", "自检执行异常：${e.message}")
+            }
+            Triple(200, "application/json; charset=utf-8", json.toString())
+        }
     }
 
     // ---- 账号管理 API ----
@@ -477,7 +563,10 @@ object WebAdminServer {
 
   <div class="card">
     <h2>🔑 一键续期</h2>
-    <button class="btn btn-renew" onclick="doRenew()" id="btnRenew" style="width:100%;">🔄 强制刷新登录态</button>
+    <div class="btn-row">
+      <button class="btn btn-renew" onclick="doRenew()" id="btnRenew">🔄 强制刷新登录态</button>
+      <button class="btn btn-query" onclick="doSelfCheck()" id="btnSelfCheck">🩺 自检 Token</button>
+    </div>
     <div class="result" id="renewResult"></div>
   </div>
 
@@ -570,6 +659,19 @@ function doRenew(){
     else el.textContent='❌ '+d.msg;
     loadStatus();
   }).catch(function(e){ el.className='result err show'; el.textContent='请求失败: '+e.message; }).finally(function(){ btn.disabled=false; });
+}
+
+function doSelfCheck(){
+  var el=document.getElementById('renewResult'), btn=document.getElementById('btnSelfCheck');
+  btn.disabled=true; el.className='result info show'; el.textContent='正在自检 Token…\n（用真实卡号查询+诊断验证 token 可用性）';
+  fetch('/api/selfcheck',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+    if(d.status==='ok') el.className='result ok show';
+    else if(d.status==='partial') el.className='result info show';
+    else el.className='result err show';
+    el.textContent=d.detail;
+    loadStatus();
+  }).catch(function(e){ el.className='result err show'; el.textContent='自检请求失败: '+e.message; })
+  .finally(function(){ btn.disabled=false; });
 }
 
 // ---- AI OCR ----

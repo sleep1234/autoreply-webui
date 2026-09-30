@@ -29,13 +29,13 @@ object NativeHttp {
 
     /** GET 查询请求：querySimBaseInfo?type=…&id=… */
     fun queryCard(token: String, type: String, id: String): String {
-        val query = "type=$type&id=$id"
+        val query = "type=$type&id=$id&isFromWeb=true&userId=199"
         return httpGet("$API_BASE/querySimBaseInfo?$query", token)
     }
 
     /** GET 诊断请求：intelligentDiagnosis?type=…&id=… */
     fun diagnose(token: String, type: String, id: String): String {
-        val query = "type=$type&id=$id"
+        val query = "type=$type&id=$id&isFromWeb=true&userId=199"
         return httpGet("$API_BASE/intelligentDiagnosis?$query", token)
     }
 
@@ -58,8 +58,8 @@ object NativeHttp {
             val url = URL(urlStr)
             conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 15_000
-                readTimeout = 20_000
+                connectTimeout = 30_000
+                readTimeout = 60_000
                 // 禁用自动重定向：token 失效时 CTWing 会 302→登录页→302 死循环，
                 // HttpURLConnection 默认跟 20 次后抛 "Too many follow-up requests"。
                 // 手动处理：遇到 302/303/307/308 返回空，由上层决定下一步。
@@ -99,8 +99,8 @@ object NativeHttp {
             conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
-                connectTimeout = 15_000
-                readTimeout = 20_000
+                connectTimeout = 30_000
+                readTimeout = 60_000
                 // 同 httpGet：禁用自动重定向，避免 token 失效时的 302 死循环
                 instanceFollowRedirects = false
                 for ((k, v) in COMMON_HEADERS) setRequestProperty(k, v)
