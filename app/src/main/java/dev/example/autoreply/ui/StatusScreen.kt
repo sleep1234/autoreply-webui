@@ -11,6 +11,7 @@ import androidx.compose.ui.unit.sp
 import dev.example.autoreply.ctwing.CtwingFacade
 import dev.example.autoreply.ctwing.CtwingWebViewHook
 import dev.example.autoreply.ctwing.NativeHttp
+import dev.example.autoreply.tunnel.TunnelConfig
 import dev.example.autoreply.tunnel.TunnelManager
 import dev.example.autoreply.hook.TinkerGuard
 import kotlinx.coroutines.Dispatchers
@@ -55,7 +56,9 @@ fun StatusScreen(
                         false
                     } else {
                         runCatching {
-                            val body = NativeHttp.basicInfo(token!!, "iccid", "89860620140020723456")
+                            val card = TunnelConfig.current().selfCheckCard
+                            val idType = dev.example.autoreply.ctwing.CtwingKeywordRouter.inferType(card)
+                            val body = NativeHttp.basicInfo(token!!, idType, card)
                             !body.contains("\"code\":401")
                         }.getOrDefault(false)
                     }

@@ -115,6 +115,17 @@ fun TunnelScreen(
             )
         }
 
+        Spacer(Modifier.height(12.dp))
+
+        // 自检测试卡号（与隧道开关无关，始终显示）
+        OutlinedTextField(
+            value = cfg.selfCheckCard,
+            onValueChange = { cfg = cfg.copy(selfCheckCard = it) },
+            label = { Text("自检测试卡号（ICCID 或接入号）") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+        )
+
         Spacer(Modifier.height(16.dp))
 
         // 保存按钮

@@ -11,6 +11,9 @@ object TunnelConfig {
 
     private const val FILE_NAME = "config.json"
 
+    /** 默认自检测试卡号（ICCID），所有自检/续期验证的兜底值。 */
+    const val DEFAULT_SELF_CHECK_CARD = "8986032548200686692"
+
     data class Config(
         val enabled: Boolean = false,
         val serverAddr: String = "",
@@ -18,6 +21,8 @@ object TunnelConfig {
         val authToken: String = "",
         val remotePort: Int = 0,
         val localPort: Int = 60080,
+        /** 自检/续期验证用的测试卡号（ICCID 或接入号均可）。 */
+        val selfCheckCard: String = DEFAULT_SELF_CHECK_CARD,
     )
 
     @Volatile
@@ -41,6 +46,7 @@ object TunnelConfig {
                 authToken = j.optString("authToken", ""),
                 remotePort = j.optInt("remotePort", 0),
                 localPort = j.optInt("localPort", 60080),
+                selfCheckCard = j.optString("selfCheckCard", DEFAULT_SELF_CHECK_CARD),
             )
         } catch (_: Exception) { Config() }
     }
@@ -55,6 +61,7 @@ object TunnelConfig {
             put("authToken", cfg.authToken)
             put("remotePort", cfg.remotePort)
             put("localPort", cfg.localPort)
+            put("selfCheckCard", cfg.selfCheckCard)
         }
         f.writeText(j.toString(2))
         cached = cfg

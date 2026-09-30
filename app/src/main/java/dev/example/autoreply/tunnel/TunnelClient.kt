@@ -49,12 +49,12 @@ class TunnelClient(
                 // AUTH
                 writeLine(output, "AUTH $authToken")
                 val authResp = readLine(input)
-                if (authResp != "AUTH_OK") { sock.close(); Thread.sleep(5000L); continue }
+                if (authResp != "AUTH_OK") { XposedBridge.log("[Tunnel] auth failed: $authResp"); sock.close(); Thread.sleep(5000L); continue }
 
                 // REGISTER
                 writeLine(output, "REGISTER $remotePort")
                 val reg = readLine(input)
-                if (reg == null || !reg.startsWith("REGISTER_OK")) { sock.close(); Thread.sleep(5000L); continue }
+                if (reg == null || !reg.startsWith("REGISTER_OK")) { XposedBridge.log("[Tunnel] register failed: $reg"); sock.close(); Thread.sleep(5000L); continue }
 
                 connected = true
                 XposedBridge.log("[Tunnel] connected remote=$remotePort")
@@ -82,8 +82,10 @@ class TunnelClient(
                 }
                 connected = false
                 try { sock.close() } catch (_: Exception) {}
+                XposedBridge.log("[Tunnel] control connection closed")
             } catch (e: Exception) {
                 connected = false
+                XposedBridge.log("[Tunnel] control error: ${e.message}")
             }
             if (running) Thread.sleep(5000L)
         }
