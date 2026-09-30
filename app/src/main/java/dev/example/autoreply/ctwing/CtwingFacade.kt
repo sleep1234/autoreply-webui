@@ -115,12 +115,6 @@ object CtwingFacade {
     //  Public API
     // ------------------------------------------------------------------
 
-    suspend fun dump(): String = callJs("window.__ctwing.dump()")
-    suspend fun recon(): String = callJs("window.__ctwing.recon()")
-    suspend fun reconReport(): String = callJs("window.__ctwing.reconReport()")
-    suspend fun discover(): String = callJs("window.__ctwing.discover()")
-    suspend fun uiDump(): String = callJs("window.__ctwing.uiDump()")
-
     /**
      * Actively PULL token + bond from the SPA via evaluateJavascript.
      * Does NOT rely on JS bridge push (addJavascriptInterface is unreliable
@@ -435,15 +429,6 @@ object CtwingFacade {
             XposedBridge.log("$TAG rebuild failed: ${e.message}")
         }
     }
-    suspend fun extractCredentials(): String = callJs("window.__ctwing.extractCredentials()")
-
-    /** Fire-and-forget via evaluateJavascript. Used by capture/recon probes. */
-    suspend fun queryCard(iccid: String): String {
-        acquireWakeLock()
-        fireJs("window.__ctwing.queryCard('${escapeJs(iccid)}')")
-        return "dispatched"
-    }
-
     /** POST operationCommit via WebView (for rebind JKCB). */
     suspend fun operationCommit(payload: String) {
         acquireWakeLock()

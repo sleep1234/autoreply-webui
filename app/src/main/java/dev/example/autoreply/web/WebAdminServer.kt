@@ -5,6 +5,7 @@ import dev.example.autoreply.ctwing.CtwingFacade
 import dev.example.autoreply.ctwing.CtwingKeywordRouter
 import dev.example.autoreply.ctwing.CtwingWebViewHook
 import dev.example.autoreply.ctwing.NativeHttp
+import dev.example.autoreply.tunnel.TunnelConfig
 import dev.example.autoreply.tunnel.TunnelManager
 import dev.example.autoreply.hook.TinkerGuard
 import dev.example.autoreply.ui.WhitelistStore
@@ -27,10 +28,8 @@ import java.util.concurrent.ConcurrentHashMap
  * -- API --
  * POST /api/login {username,password}           -- 登录
  * POST /api/status                              -- 服务状态（需登录）
- * POST /api/query {iccid}                       -- 查询
  * POST /api/diagnose {iccid}                    -- 诊断
  * POST /api/rebind {iccid}                      -- 重绑
- * POST /api/renew                               -- 续期
  * POST /api/ocr     (multipart: image)          -- AI 识图 ICCID
  * POST /api/accounts/list                       -- 列出所有账户（admin only）
  * POST /api/accounts/add {username,password,role} -- 添加账户（admin only）
@@ -173,10 +172,8 @@ object WebAdminServer {
         p == "/api/login" && m == "POST" -> login(b)
         // 以下全需登录
         p == "/api/status" && m == "POST" -> auth(h) { _ -> status() }
-        p == "/api/query" && m == "POST" -> auth(h) { _ -> query(b) }
         p == "/api/diagnose" && m == "POST" -> auth(h) { _ -> diagnose(b) }
         p == "/api/rebind" && m == "POST" -> auth(h) { _ -> rebind(b) }
-        p == "/api/renew" && m == "POST" -> auth(h) { _ -> renew() }
         p == "/api/ocr" && m == "POST" -> auth(h) { _ -> ocr(uploaded) }
         p == "/api/accounts/list" && m == "POST" -> auth(h) { sess -> accountsList(sess) }
         p == "/api/accounts/add" && m == "POST" -> auth(h) { sess -> accountsAdd(sess, b) }
@@ -252,23 +249,6 @@ object WebAdminServer {
         return Triple(200, "application/json; charset=utf-8", j.toString())
     }
 
-    private suspend fun query(p: Map<String, String>): Triple<Int, String, String> {
-        val iccid = p["iccid"] ?: return err("请提供卡号")
-        return try {
-            val result = CtwingFacade.webViewMutex.withLock {
-                val idType = CtwingKeywordRouter.inferType(iccid)
-                val raw = CtwingKeywordRouter.nativeGetWithRetry("web-query") { NativeHttp.queryCard(it, idType, iccid) }
-                val em = raw?.let { CtwingKeywordRouter.extractQueryError(it) }
-                if (em != null) "⚠️ 查询失败：$em"
-                else {
-                    val best = raw?.let { CtwingKeywordRouter.extractBestResponse(it) }
-                    best?.let { CtwingKeywordRouter.formatCardInfo(it) } ?: "⚠️ 查询未完成，请稍后重试或发送「续期」刷新登录态"
-                }
-            }
-            ok(result)
-        } catch (e: Exception) { err("查询失败: ${e.message}") }
-    }
-
     private suspend fun diagnose(p: Map<String, String>): Triple<Int, String, String> {
         val iccid = p["iccid"] ?: return err("请提供卡号")
         return try {
@@ -296,21 +276,6 @@ object WebAdminServer {
         } catch (e: Exception) { err("重绑失败: ${e.message}") }
     }
 
-    private suspend fun renew(): Triple<Int, String, String> {
-        return try {
-            val old = NativeHttp.cachedToken ?: ""
-            val nt = CtwingFacade.webViewMutex.withLock {
-                CtwingFacade.forceRebuild(40_000L)
-                CtwingFacade.pullToken()
-                NativeHttp.cachedToken ?: ""
-            }
-            val json = org.json.JSONObject().apply {
-                put("ok", true); put("oldToken", old); put("newToken", nt); put("changed", old != nt)
-            }
-            Triple(200, "application/json; charset=utf-8", json.toString())
-        } catch (e: Exception) { err("续期失败: ${e.message}") }
-    }
-
     // ---- AI 识图 ----
 
     private suspend fun ocr(uploaded: ByteArray): Triple<Int, String, String> {
@@ -332,7 +297,7 @@ object WebAdminServer {
     // ---- 自检：用真实 token 发查询 + 诊断，验证 token 实际可用 ----
 
     private suspend fun selfCheck(): Triple<Int, String, String> {
-        val testIccid = "8986032548200686692"
+        val testIccid = TunnelConfig.current().selfCheckCard.ifBlank { TunnelConfig.DEFAULT_SELF_CHECK_CARD }
         val idType = CtwingKeywordRouter.inferType(testIccid)
         return try {
             CtwingFacade.webViewMutex.withLock {

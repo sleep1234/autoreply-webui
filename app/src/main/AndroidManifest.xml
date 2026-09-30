@@ -17,10 +17,5 @@
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
 
-        <activity
-            android:name=".ui.SettingsActivity"
-            android:exported="false"
-            android:label="自动回复白名单" />
-
     </application>
 </manifest>

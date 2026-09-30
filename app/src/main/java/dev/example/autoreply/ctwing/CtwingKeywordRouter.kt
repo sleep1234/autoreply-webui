@@ -54,12 +54,6 @@ object CtwingKeywordRouter {
         // 命令容错：用 contains 而非 startsWith，支持「帮我查一下 8986...」「8986... 查询」等
         // 但保持关键词优先级：重绑 > 诊断 > 查询，避免「查询」误匹配「重绑查询」
         val op = when {
-            lower.contains("界面") || lower.contains("uidump") -> "uiDump"
-            lower.contains("发现") || lower.contains("discover") -> "discover"
-            lower.contains("取凭证") || lower.contains("credential") -> "credential"
-            lower.contains("捕获") || lower.contains("capture") -> "capture"
-            lower.contains("侦察报告") || lower.contains("reconreport") -> "reconReport"
-            lower.contains("加密侦察") || lower.contains("recon") -> "recon"
             lower.contains("重绑") || lower.contains("rebind") || lower.contains("解绑") -> "rebind"
             lower.contains("诊断") || lower.contains("diagnose") -> "diagnose"
             lower.contains("查询") || lower.contains("查卡") || lower.contains("query") -> "query"
@@ -67,87 +61,6 @@ object CtwingKeywordRouter {
             lower.contains("续期") || lower.contains("renew") || lower.contains("刷新token") -> "renew"
             lower.contains("状态") || lower.contains("status") || lower.contains("自检") -> "status"
             else -> return false
-        }
-
-        // NOTE: query/diagnose try native HTTP FIRST (no WebView needed),
-        // then fall back to WebView via ensureReady. The global guard below
-        // is only for UI-dump/discover/recon commands that need a live WebView.
-
-        // ---- UI dump: no ICCID needed ----
-        if (op == "uiDump") {
-            try {
-                val ui = CtwingFacade.uiDump()
-                send("📱 界面结构：\n${ui.take(2000)}")
-            } catch (e: Exception) {
-                send("❌ UI dump失败：${e.message}")
-            }
-            return true
-        }
-
-        // ---- Diagnostic dump: no ICCID needed ----
-        if (op == "discover") {
-            try {
-                val surface = CtwingFacade.discover()
-                send("🔍 服务发现：\n${surface.take(1500)}")
-            } catch (e: Exception) {
-                send("❌ 发现失败：${e.message}")
-            }
-            return true
-        }
-
-        // ---- Crypto recon: no ICCID needed ----
-        if (op == "recon") {
-            try {
-                val scan = CtwingFacade.recon()
-                send("🔐 加密侦察：\n${scan.take(1500)}")
-            } catch (e: Exception) {
-                send("❌ 侦察失败：${e.message}")
-            }
-            return true
-        }
-
-        if (op == "reconReport") {
-            try {
-                val report = CtwingFacade.reconReport()
-                send("🔐 侦察报告：\n${report.take(1500)}")
-            } catch (e: Exception) {
-                send("❌ 报告失败：${e.message}")
-            }
-            return true
-        }
-
-        // credential needs NO identifier — handle before the ICCID check.
-        if (op == "credential") {
-            try {
-                val creds = CtwingFacade.extractCredentials()
-                // Save to WeChat data dir for offline use
-                try {
-                    val dir = java.io.File(CtwingIpcBridge.wechatDataDir, "dsh_ctwing_bundles")
-                    dir.mkdirs()
-                    java.io.File(dir, "credentials.json").writeText(creds)
-                    XposedBridge.log("$TAG credentials saved to credentials.json")
-                } catch (e: Exception) {
-                    XposedBridge.log("$TAG cred save failed: ${e.message}")
-                }
-                send("🔐 凭证：\n${creds.take(1500)}")
-            } catch (e: Exception) {
-                send("❌ 取凭证失败：${e.message}")
-            }
-            return true
-        }
-
-        // capture needs NO identifier — handle it before the ICCID check.
-        if (op == "capture") {
-            try {
-                // Trigger a queryCard to force sbu1 encryption, then read recon state
-                CtwingFacade.queryCard("89860620140020723456")
-                kotlinx.coroutines.delay(5_000L)
-                val report = CtwingFacade.reconReport()
-                send("🔑 密钥捕获结果：\n${report.take(1500)}")
-            } catch (e: Exception) {
-                send("❌ 捕获失败：${e.message}")
-            }
-            return true
         }
 
         // ---- 状态自检：用 basicInfo 真实验证 token 是否有效 ----
@@ -159,11 +72,13 @@ object CtwingKeywordRouter {
 
                 // 真实验证 token：用 basicInfo 探活（最轻量接口）
                 val token = NativeHttp.cachedToken
+                val selfCheckCard = dev.example.autoreply.tunnel.TunnelConfig.current().selfCheckCard
+                val idType = inferType(selfCheckCard)
                 val tokenValid = if (token.isNullOrBlank()) {
                     false
                 } else {
                     runCatching {
-                        val body = NativeHttp.basicInfo(token, "iccid", "89860620140020723456")
+                        val body = NativeHttp.basicInfo(token, idType, selfCheckCard)
                         // basicInfo 成功返回 data 对象，而不是 code=401
                         !body.contains("\"code\":401")
                     }.getOrDefault(false)
@@ -178,7 +93,7 @@ object CtwingKeywordRouter {
                         CtwingFacade.pullToken()
                         val newToken = NativeHttp.cachedToken ?: ""
                         val renewed = runCatching {
-                            val body = NativeHttp.basicInfo(newToken, "iccid", "89860620140020723456")
+                            val body = NativeHttp.basicInfo(newToken, idType, selfCheckCard)
                             !body.contains("\"code\":401")
                         }.getOrDefault(false)
                         val sb = StringBuilder()

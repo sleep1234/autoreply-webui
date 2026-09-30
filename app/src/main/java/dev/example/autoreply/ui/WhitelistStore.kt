@@ -45,11 +45,6 @@ object WhitelistStore {
     @Volatile
     private var uiPrefs: SharedPreferences? = null
 
-    /** 模块 UI 进程初始化写入能力（独立 SettingsActivity 用） */
-    fun initForUi(ctx: Context) {
-        uiPrefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    }
-
     /** 获取模块存储目录下的文件，每次调用确保目录存在。 */
     private fun moduleFile(filename: String): File {
         val dir = filesDir
