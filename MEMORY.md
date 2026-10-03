@@ -1,6 +1,6 @@
 # 天翼物联一站式服务工具 — 开发复盘与经验总结
 
-> 2026-09-27 | 全会话复盘（两轮对话合并）
+> 2026-09-30 | 全会话复盘（多轮对话合并，含 Web 后台 + 内网穿透 + 死代码清理）
 
 ---
 
@@ -50,6 +50,10 @@
 | 40 | **网页端 forceRebuild 杀 H5** | 误改成 rebuildAndWait(force=true) 完整重建 | 恢复 reloadOAuthOnPool（对现有 WebView 重走 OAuth，不杀 H5） |
 | 41 | **网页响应 Content-Length 错乱** | toByteArray() 用系统 charset(GBK) vs BufferedWriter UTF-8 | 统一 UTF-8 + raw OutputStream.write(byte[]) + shutdownOutput |
 | 42 | **网页 ERR_CONNECTION_ABORTED** | BufferedWriter + socket.close() 先发 RST | raw OutputStream + shutdownOutput(FIN) + 200ms 延迟 close |
+| 43 | **死代码堆积（第二轮）** | AutoReplyEngine/OpenAiClient/MediaHandler/SettingsActivity 无调用者 + 调试命令残留 | 删除四文件 + 调试命令（uiDump/discover/recon/reconReport/credential/capture）+ CtwingFacade 七方法 + dump() |
+| 44 | **WebAdmin 自检 401 不重试** | selfCheck 直接调 NativeHttp，未走 nativeGetWithRetry | selfCheck 改用 nativeGetWithRetry 自动 401→forceRebuild→重试 |
+| 45 | **内网穿透替代 frpc** | frpc 16MB Go 二进制 + SELinux exec 拦截 error=13 | 自研纯 Socket TCP 反向隧道（TunnelClient/TunnelManager/TunnelConfig） |
+| 46 | **自检测试卡号分散硬编码** | 三处（Web selfCheck/StatusScreen/聊天 status）各写死测试卡号 | TunnelConfig.selfCheckCard 统一配置（默认 8986032548200686692） |
 
 ---
 
@@ -84,6 +88,14 @@ git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 pus
 ```
 
 不要用 `http.proxy=`（空）——那是"绕过代理直连"，正是失败的原因。
+
+### 文件修改
+
+含中文的 .kt/.md 文件**禁止**用 PowerShell `Set-Content`/字符串替换（会破坏 UTF-8 中文成乱码），必须用 edit/write 工具。
+
+### 业务复用
+
+Web 端所有 CTWing 操作必须复用聊天端同一套函数（nativeGetWithRetry / executeRebind / forceRebuild+pullToken），禁止复制粘贴业务逻辑。
 
 ---
 
@@ -245,29 +257,41 @@ rebuildAndWait:
 
 ---
 
-## 五、修改文件清单（本次会话）
+## 五、修改文件清单（初始化至今）
 
 | 文件 | 改动 |
 |------|------|
-| `MainHook.kt` | 白名单逻辑反转（空=不回复）+ WhitelistStore.initWithDataDir |
-| `WhitelistStore.kt` | 存储路径改微信 dataDir + 双开兼容 + 诊断日志 |
-| `WhitelistScreen.kt` | 打开默认全不勾选 + 清空立即保存 + 保存按钮日志 |
-| `CtwingKeywordRouter.kt` | 诊断补 pullToken + 业务错误检测 |
-| `AndroidManifest.xml` | 模块更名/去桌面图标/静态scope |
+| `MainHook.kt` | 白名单逻辑反转（空=不回复）+ 引擎启动 + WebAdmin + TunnelManager |
+| `WhitelistStore.kt` | 存储路径改微信 dataDir + 双开兼容 + 死代码 initForUi 已删 |
+| `WhitelistScreen.kt` | 仅微信进程弹窗模式（独立 SettingsActivity 分支已删） |
+| `CtwingKeywordRouter.kt` | 补 pullToken + nativeGetWithRetry + executeRebind + 死代码已删 |
+| `CtwingFacade.kt` | pullToken 缓存 TTL + forceRebuild + 死代码已删（7 个调试方法 + dump） |
+| `NativeHttp.kt` | 30/60s 超时 + instanceFollowRedirects=false + errorStream 兜底 |
+| `CtwingWebViewHook.kt` | 预初始化 + findForHost + 超时释放 |
+| `TokenKeepAlive.kt` | 30s tick + 30min 刷新 + 启动延迟 15s |
+| `WebAdminServer.kt`（新增） | 内置 HTTP Server 端口 60080（约 900 行） |
+| `AccountStore.kt`（新增） | 账号 CRUD (SHA-256) |
+| `AgnesAiClient.kt`（新增） | AI OCR ICCID 识别 |
+| `TunnelClient.kt`（新增） | 自研 TCP 反向隧道客户端 |
+| `TunnelManager.kt`（新增） | 隧道生命周期管理 |
+| `TunnelConfig.kt`（新增） | 隧道 JSON 配置（含 selfCheckCard） |
+| `StatusScreen.kt` | 服务状态面板（真实验证+一键续期+TinkerGuard） |
+| `TunnelScreen.kt` | 内网穿透配置 + 自检测试卡号输入 |
+| `TunnelLauncher.kt`（新增） | 穿透启动入口 |
+| `AndroidManifest.xml` | 模块更名/去桌面图标/静态scope/删SettingsActivity声明 |
 | `arrays.xml`（新增） | 静态作用域声明 |
-| `ARCHITECTURE.md` | 方案A描述 + 模块元信息 |
-| `开发总结.md` | 踩坑清单扩展（新增 5 条） |
-| `MEMORY.md` | 复盘总结（合并两轮对话） |
-| `AtMentionHook.kt`（新增） | 真实 @ 通知：DexKit 解析 + 消息入库 hook + atuserlist 注入 |
-| `WeDatabaseApi.kt` | 新增 getNickname(wxid) 查 rcontact |
+| `AutoReplyEngine.kt` | **已删除**（死代码） |
+| `OpenAiClient.kt` | **已删除**（死代码） |
+| `MediaHandler.kt` | **已删除**（死代码） |
+| `SettingsActivity.kt` | **已删除**（死代码） |
 
 ---
 
 ## 六、安全修改区域
 
-**可以安全修改**：`CtwingKeywordRouter.kt` 格式化/文案、`MainHook.kt` 欢迎回复、`AndroidManifest.xml` 元信息
+**可以安全修改**：`CtwingKeywordRouter.kt` 格式化/文案、`MainHook.kt` 欢迎回复、`AndroidManifest.xml` 元信息、`WebAdminServer.kt` 前端 HTML
 
-**需要谨慎**：`CtwingFacade.kt` pullToken/rebuildH5、`CtwingWebViewHook.kt` WebView 定位、`WebViewPool.kt` overlay 创建、`NativeHttp.kt` HTTP 请求、`AtMentionHook.kt` DexKit 解析与 atuserlist 注入
+**需要谨慎**：`CtwingFacade.kt` pullToken/forceRebuild/rebuildH5、`CtwingWebViewHook.kt` WebView 定位、`WebViewPool.kt` overlay 创建、`NativeHttp.kt` HTTP 请求、`AtMentionHook.kt` DexKit 解析与 atuserlist 注入、`TokenKeepAlive.kt` 保活循环、`tunnel/*` 隧道协议
 
 ---
 
@@ -305,7 +329,7 @@ rebuildAndWait:
 1. 模块加载 → 消息捕获引擎 + 白名单 + AtMention 初始化
 2. `preInitH5()`：静默打开 CTWing OAuth（独立任务栈）→ 偷取 WebView 到透明 overlay → moveTaskToBack
 3. `pullToken()` 拉取 ACCESS_TOKEN 缓存
-4. `TokenKeepAlive` 每 25 分钟保活 token（WebView 死亡自动重建）
+4. `TokenKeepAlive` 每 30s tick 检测 WebView（死亡自动重建）；存活且超 30min → forceRebuild 刷新 token
 
 **消息处理阶段**（收到消息）：
 ```
@@ -321,10 +345,17 @@ rebuildAndWait:
 
 **Web 管理后台**（浏览器访问 `http://<设备IP>:60080/`）：
 ```
-登录（默认密码 admin123，SHA-256 存 web_password.hash）
-  → /api/query  /api/diagnose  /api/rebind  /api/renew
-  → 全部复用窗口端同一套业务函数（webViewMutex 统一队列）
+登录（默认 admin/admin123，SHA-256 存 accounts.json，Bearer token 会话验证）
+  → /api/status  /api/diagnose  /api/rebind  /api/selfcheck  /api/ocr
+  → 全部复用窗口端同一套业务函数（nativeGetWithRetry / executeRebind，webViewMutex 统一队列）
   → 返回 JSON {ok, result/msg}
+```
+
+**内网穿透**（自研 TCP 反向隧道，替代 frpc）：
+```
+TunnelClient（设备端）→ NAS tunnel_server.py（控制端口 7000，systemd 开机自启）
+  → 设备1 remotePort 60080 / 设备2 remotePort 60081
+  → 公网域名 www.zhp98.fun 经路由器端口转发可达 Web 后台
 ```
 
 **异常恢复阶段**（WebView 被杀 / token 过期）：

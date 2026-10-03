@@ -1,6 +1,6 @@
 # 天翼物联一站式服务工具 — 技术架构文档
 
-> 更新：2026-09-27 | 微信 8.0.76 | Xiaomi 14 Pro KernelSU
+> 更新：2026-09-30 | 微信 8.0.76 | Xiaomi 14 Pro KernelSU
 
 ---
 
@@ -20,8 +20,10 @@
 │    ├─ BufferedMessageTrigger (1.5s 聚合, 5条上限, 5s 最大等待)     │
 │    │    └→ onFlush: 去重 → 白名单 → @过滤 → CTWing路由 → 兜底回复  │
 │    │                                                              │
-│    ├─ PopupMenuHook: "+"菜单注入白名单入口                          │
-│    ├─ TokenKeepAlive: 25分钟 token 心跳                            │
+│    ├─ PopupMenuHook: "+"菜单注入白名单/状态/穿透三入口              │
+│    ├─ TokenKeepAlive: 30s tick + 30min token 刷新                │
+│    ├─ WebAdminServer: 内置 HTTP 后台 (端口 60080)                  │
+│    ├─ TunnelManager: 自研 TCP 反向隧道                             │
 │    └─ 方案A: 静默启动 (NEW_DOCUMENT+MULTIPLE_TASK + moveTaskToBack) │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -30,7 +32,7 @@
 
 | 进程 | 初始化内容 |
 |------|-----------|
-| `com.tencent.mm` (主) | DexKit + TinkerGuard + 引擎 + 白名单 + TokenKeepAlive + H5预初始化 |
+| `com.tencent.mm` (主) | DexKit + TinkerGuard + 引擎 + 白名单 + TokenKeepAlive + H5预初始化 + WebAdmin + 内网穿透 |
 | `:xweb_*` / `:tools` | 仅 CtwingWebViewHook + CtwingNetworkHook + CtwingBundleCapture |
 | `:push` / `:appbrand*` | 跳过（仅打日志） |
 
@@ -67,19 +69,14 @@ onFlush → 逐条处理:
   │       失败时兜底: WeDatabaseApi.isAtMe() → rawQuery lvbuffer
   │
   ├─ ④ CTWing 关键词路由
-  │     CtwingKeywordRouter.tryHandle() → 见 §三
+  │     CtwingKeywordRouter.tryHandle() → webViewMutex.withLock
+  │       query   → nativeGetWithRetry → formatCardInfo
+  │       diagnose → nativeGetWithRetry → formatDiagnosis
+  │       rebind   → executeRebind (XHR → fallback NativeHttp)
+  │       renew    → forceRebuild + pullToken + 新旧对比
+  │       status   → basicInfo 真实验证
   │
   └─ ⑤ 兜底回复（非 CTWing 命令统一回复欢迎帮助）
-        """
-        🤖 欢迎使用天翼物联一站式服务工具！
-        
-        📋 可用命令：
-        · 查询 ICCID或接入号 — 查询卡片详情
-        · 诊断 ICCID或接入号 — 诊断卡片情况
-        · 重绑 ICCID或接入号 — 机卡重绑
-        
-        💡 使用方式：@我 + 命令
-        """
 ```
 
 ### 2.1 @ 解析流程 (AtParser)
@@ -98,7 +95,6 @@ lvBuffer (ByteArray, 361 bytes)
 ### 2.2 selfWxId 获取
 
 ```kotlin
-// 反射读 WeChat SharedPreferences
 val ctx = ActivityThread.currentActivityThread().application
 val prefs = ctx.getSharedPreferences("com.tencent.mm_preferences", Context.MODE_PRIVATE)
 val wxId = prefs.getString("login_weixin_username", null)
@@ -112,65 +108,54 @@ val wxId = prefs.getString("login_weixin_username", null)
 
 ### 3.1 操作分流表
 
-| 操作 | 识别词 | HTTP 方法 | 传输层 | 原因 |
-|------|--------|----------|--------|------|
-| 查询 | 查询/查卡/query | GET | **NativeHttp** | GET 无 CSRF |
-| 诊断 | 诊断/diagnose | GET | **NativeHttp** | GET 无 CSRF |
-| 重绑 | 重绑/rebind | POST | **WebView XHR** | POST 有 CSRF |
+| 操作 | 识别词 | HTTP 方法 | 传输层 | 共用函数 |
+|------|--------|----------|--------|---------|
+| 查询 | 查询/查卡/query | GET | **NativeHttp** | nativeGetWithRetry + formatCardInfo |
+| 诊断 | 诊断/diagnose | GET | **NativeHttp** | nativeGetWithRetry + formatDiagnosis |
+| 重绑 | 重绑/rebind/解绑 | POST | **WebView XHR → NativeHttp fallback** | executeRebind |
+| 续期 | 续期/renew | OAuth reload | **WebView** | forceRebuild + pullToken |
+| 自检 | 状态/status | GET | **NativeHttp** | nativeGetWithRetry + basicInfo |
 
-### 3.2 查询流程（NativeHttp GET）
-
-```
-pullToken()                           ← evaluateJavascript 读 WebView cookie
-  └→ NativeHttp.cachedToken = token
-queryCard(token, type, id)
-  → HttpURLConnection GET /querySimBaseInfo?type=&id=
-  → 头: Authorization Bearer + Cookie + Origin/Referer
-  → 响应: {"code":0,"data":{"simBasicInfoRespVO":{...}}}
-  → extractBestResponse → 优先取 body 字段, 兜底 data/diag/dom
-  → formatCardInfo → "📱 查询结果 · 客户名 · 产品名\nSIM状态: …"
-```
-
-### 3.3 诊断流程（NativeHttp GET）
-
-```
-diagnose(token, type, id)
-  → HttpURLConnection GET /intelligentDiagnosis?type=&id=
-  → 响应: {"code":0,"data":{"simBasicInfoRespVO":{...},"networkDisconnect":{...}}}
-  → extractBestResponse
-  → formatDiagnosis → "🔍 诊断报告 · 客户名 · 产品名\n✅ 断网：正常\n…"
-```
-
-### 3.4 重绑流程（WebView XHR POST）
-
-```
-pullToken()
-  → fireJs("window.__ctwing.operationCommit('{...}')")   ← JS 异步 XHR
-  → for (1..15) pollDshResult():
-       evaluateJsForResult("window.__dshResult", 2000ms)
-       等待 "operationCommit-ok" 或 实际数据
-  → 解析 JSON {status, body}:
-       wrap.has("status") && wrap.has("body")
-         → 剥 body 字段                          (兼容 WebView XHR 包装)
-         → wrap 自身                             (兼容 NativeHttp 裸 JSON)
-  → when { code==401, code!=0, status含成功/失败, else }
-  → "✅ 机卡重绑成功（工单：2104070408868220929）"
-```
-
-POST 走 WebView XHR 的原因：NativeHttp POST 被 CTWing 服务器返回 403（CSRF 校验），加 Origin/Referer/Cookie 均无效，必须由浏览器内核自带上下文通过。
-
-### 3.5 并发互斥
+### 3.2 请求重试机制 (nativeGetWithRetry)
 
 ```kotlin
-// CtwingKeywordRouter.kt
-CtwingFacade.webViewMutex.withLock {
-    when (op) { "query" -> ..., "diagnose" -> ..., "rebind" -> ... }
+suspend fun nativeGetWithRetry(tag: String, request: () -> String): String {
+    pullToken()  // 确保 token 有效（10min 缓存 TTL）
+    var resp = request()
+    if (resp.contains("\"code\":401")) {
+        forceRebuild()  // 重走 OAuth 换新 token
+        pullToken()     // 重拉
+        resp = request() // 重试
+    }
+    return resp
 }
 ```
 
-`webViewMutex` 是 `Mutex`，串行化三个操作。根因：`CtwingJsBridge.lastApiResponse` 是全局单例，并发操作会互相覆盖响应。
+### 3.3 重绑流程（executeRebind — 聊天/Web 共用）
 
-### 3.6 Wake Lock
+```
+pullToken()
+  ├─ 幂等检查：30s 窗口内同卡号不重复
+  ├─ fireJs("window.__ctwing.operationCommit('{...}')")
+  ├─ 轮询 pollDshResult() (15次 × 2s)
+  ├─ XHR 成功 → 解析 → 返回
+  └─ XHR 超时 → Fallback NativeHttp POST（带 cachedCookie）
+       → 401 → forceRebuild → 重试 → 解析 → 返回
+```
+
+### 3.4 并发互斥
+
+```kotlin
+// CtwingKeywordRouter.kt — 聊天端
+CtwingFacade.webViewMutex.withLock { ... }
+
+// WebAdminServer.kt — Web 端
+CtwingFacade.webViewMutex.withLock { ... }
+```
+
+`webViewMutex` 串行化所有 CTWing 操作。锁序：webViewMutex → rebuildMutex（单向，无死锁）。
+
+### 3.5 Wake Lock
 
 ```kotlin
 acquireWakeLock()  // SCREEN_DIM_WAKE_LOCK, 50s
@@ -178,23 +163,23 @@ acquireWakeLock()  // SCREEN_DIM_WAKE_LOCK, 50s
 releaseWakeLock()
 ```
 
-防止锁屏时 WebView/X5 的 JS 引擎冻结。NativeHttp 查询/诊断不需要此机制（纯 Java HTTP），但重绑的 fireJs + pollDshResult 需要。
+防止锁屏时 WebView/X5 的 JS 引擎冻结。
 
 ---
 
 ## 四、关键数据结构
 
-### 4.1 IncomingMessage (IWeChatHook.kt)
+### 4.1 IncomingMessage
 
 ```kotlin
 data class IncomingMessage(
-    val msgSvrId: Long?,        // 消息服务端 ID
+    val msgSvrId: Long?,
     val type: Int?,             // 1=文本
     val talker: String?,        // 发送者 wxid / 群聊 id
-    val content: String?,       // 消息正文 (群聊: wxid_xxx:@昵称 正文)
-    val isSend: Boolean,        // true=自己发的
+    val content: String?,       // 群聊: wxid_xxx:@昵称 正文
+    val isSend: Boolean,
     val createTime: Long?,
-    val lvBuffer: ByteArray?    // 二进制扩展字段 (含 msgSource/atuserlist)
+    val lvBuffer: ByteArray?    // 含 msgSource/atuserlist
 )
 ```
 
@@ -207,13 +192,6 @@ data class IncomingMessage(
 | `/operationCommit` | POST | `{"type","id","imei","source","orderNumber","sessionId","comment","bindType","file":{"ids":[]},"operation":"JKCB"}` |
 
 BASE: `https://tywlonestop.ctwing.cn:8081/webapp-font/admin-api/bpm/service-assistant`
-
-### 4.3 白名单存储
-
-路径: `/data/data/com.tencent.mm/files/autoreply_whitelist.json`
-格式: `[{"id":"wxid_xxx","name":"昵称"},...]`
-
-使用 WeChat dataDir 而非模块自身 prefs，避免 SELinux 跨应用文件访问限制。
 
 ---
 
@@ -232,43 +210,26 @@ BASE: `https://tywlonestop.ctwing.cn:8081/webapp-font/admin-api/bpm/service-assi
 | NetSceneSendMsg | `y11.r0` | 发消息 |
 | NetSceneQueue | `com.tencent.mm.modelbase.r1` | 消息队列 |
 
-### 5.1 DexKit 定位方式
-
-- **PlusSubMenuHelper**: `searchPackages("com.tencent.mm.ui")` + `usingEqStrings("MicroMsg.PlusSubMenuHelper", "dyna plus config is null...")`
-- **addItem/handleClick**: 同上字符串匹配
-- **MenuItemData**: 5 字段匹配 (String, int, int, int, String)
-- **SparseArray 陷阱**: 存的是 wrapper(og)，不是 data(pg)，需从现有元素推断 wrapper 类，用单参构造器包装
-
 ---
 
 ## 六、NativeHttp — 纯 Java HTTP 客户端
 
-```
+```kotlin
 NativeHttp (object)
   ├─ queryCard(token, type, id)    → GET  /querySimBaseInfo
   ├─ diagnose(token, type, id)     → GET  /intelligentDiagnosis
   ├─ basicInfo(token, type, id)    → GET  /basicInfo
-  ├─ operationCommit(token, body)  → POST /operationCommit (被 403，实际不用)
+  ├─ operationCommit(token, body)  → POST /operationCommit (重绑 fallback)
   │
-  ├─ cachedToken: String?          ← pullToken 写入, 磁盘持久化
+  ├─ cachedToken: String?          ← pullToken 写入
   ├─ cachedCookie: String?         ← pullToken 写入 (完整 cookie 串)
   ├─ cachedBond: String?           ← pullToken 写入
   │
-  ├─ httpGet()                     → HttpURLConnection, 15s connect / 20s read
+  ├─ httpGet()                     → HttpURLConnection, 30s connect / 60s read
   └─ httpPost()                    → 同上 + errorStream 兜底
 ```
 
-请求头:
-```
-Accept: application/json, text/plain, */*
-User-Agent: Mozilla/5.0 (Linux; Android 15; WeChat) AppleWebKit/537.36
-Authorization: Bearer {token}
-Cookie: {cachedCookie}
-Origin: https://tywlonestop.ctwing.cn:8081
-Referer: https://tywlonestop.ctwing.cn:8081/web-apps/
-```
-
-Token 持久化路径: `{wechatDataDir}/dsh_ctwing_bundles/ctwing_token.json`
+配置：`instanceFollowRedirects=false`（手动处理 401/3xx，防重定向死循环）。
 
 ---
 
@@ -276,46 +237,26 @@ Token 持久化路径: `{wechatDataDir}/dsh_ctwing_bundles/ctwing_token.json`
 
 ```
 CtwingFacade (object)
-  ├─ webViewMutex: Mutex              ← 并发互斥锁
+  ├─ webViewMutex: Mutex              ← 全局互斥锁（聊天+Web 共用）
+  ├─ rebuildMutex: Mutex              ← 防并发重建锁
   │
   ├─ pullToken(): Boolean             ← 读 WebView cookie → cachedToken/cachedCookie
-  │     callJs("return JSON.stringify({token, bond, cookie})")
-  │     → JSONTokener 剥双重转义 → optString
+  │     10min 缓存 TTL (lastTokenPullAt)，空读取不清空缓存
   │
   ├─ pollDshResult(): String          ← 读 window.__dshResult (2s timeout)
-  ├─ readApiResponses(): String       ← lastApiResponse || evaluateJs 读 __dshResult
+  ├─ forceRebuild()                   ← reloadOAuthOnPool (H5 存活) 或 rebuildAndWait
+  ├─ reloadOAuthOnPool()              ← 对现有 WebView loadUrl OAuth
+  ├─ rebuildAndWait()                 ← 完整重建 H5（rebuildMutex 保护）
   │
-  ├─ queryCard(iccid)                 ← fireJs (异步, 调试用)
-  ├─ diagnoseCard(iccid)              ← fireJs (异步)
-  ├─ operationCommit(payload)         ← fireJs (异步, 重绑用)
-  │
-  ├─ queryCardSync/DiagnoseCardSync/OperationCommitSync  ← 同步 XHR (已弃用)
-  │
-  ├─ acquireWakeLock() / releaseWakeLock()
-  ├─ fireJs(script)                   ← evaluateJavascript (null callback)
-  └─ callJs/callJsLocal               ← evaluateJsForResult (ValueCallback)
+  └─ preInitH5()                      ← 启动延迟 15s 后静默打开 CTWing OAuth
 ```
 
-### 7.1 pullToken JSON 解析
+### 7.1 Token 策略
 
-```kotlin
-// callJs 返回 JSON.stringify() 的结果, 可能双重转义
-val obj = runCatching {
-    JSONObject(raw)                                    // 尝试直接解析
-}.recoverCatching {
-    JSONObject(JSONTokener(raw).nextValue() as String)  // 剥一层引号再解
-}.getOrNull()
-val token = obj?.optString("token", "") ?: ""
-val cookie = obj?.optString("cookie", "") ?: ""
-```
-
-### 7.2 通信方式总结
-
-| 方式 | 函数 | 返回 | 超时 | 用途 |
-|------|------|------|------|------|
-| fireJs (fire-and-forget) | `evaluateJavascript(js, null)` | Unit | N/A | 重绑 XHR |
-| callJs (同步) | `evaluateJavascript(js, callback)` | String | 15s | pullToken |
-| pollDshResult | `evaluateJavascript("return __dshResult", cb)` | String | 2s | 重绑结果轮询 |
+- pullToken 有 10 分钟缓存 TTL（`TOKEN_CACHE_TTL_MS`），`lastTokenPullAt` 时间戳
+- forceRebuild 成功后重置 `lastTokenPullAt = 0`
+- pullToken 空读取不清空 cachedToken（防 OAuth reload 后自毁）
+- TokenKeepAlive: 30s tick 检测 WebView 存活 → 死则 forceRebuild；活且超过 30min → forceRebuild
 
 ---
 
@@ -324,13 +265,12 @@ val cookie = obj?.optString("cookie", "") ?: ""
 ### 8.1 启动流程
 
 ```kotlin
-// MainHook.kt → CtwingFacade.preInitH5()
-scope.launch { delay(8_000L); CtwingFacade.preInitH5() }
+// MainHook.kt → TokenKeepAlive 启动延迟 15s
+scope.launch { delay(15_000L); TokenKeepAlive.start() }
+// → 内部 preInitH5: 静默打开 CTWing OAuth（独立任务栈）
 
-// CtwingFacade.rebuildH5()
 Intent(MMWebViewUI).apply {
     addFlags(NEW_TASK | FLAG_ACTIVITY_NEW_DOCUMENT | FLAG_ACTIVITY_MULTIPLE_TASK)
-    // H5 在独立任务栈打开——用户当前任务栈不受影响，微信首页不抢夺
 }
 ```
 
@@ -340,60 +280,87 @@ Intent(MMWebViewUI).apply {
 MMWebViewUI 创建（独立任务栈，用户无感）
   → onResume → view tree scan → 找到 CTWing WebView
   → WebViewPool.steal(webView)
-       → detach 从 MMWebViewUI
-       → 挂到透明 overlay (alpha=0, not_touchable)
+       → detach 从 MMWebViewUI → 挂到透明 overlay (alpha=0, not_touchable)
   → 窗口清理：
-       - finish 掉多余的旧 MMWebViewUI 空壳（NEW_DOCUMENT 每次建新窗口）
+       - finish 多余旧 MMWebViewUI 空壳
        - 保留最新一个 moveTaskToBack(true) 退后台保活
-  → 用户看到微信首页，H5 在 overlay 里继续运行
+  → 用户看到微信首页，H5 在 overlay 继续运行
 ```
 
-关键：
-- 用 `moveTaskToBack` 而非 `finish()` 保留最新壳——finish 会暂停 WebView 渲染器，导致 pullToken 超时
-- 但**多余的旧壳**（WebView 已被偷走、只剩空 Activity）必须 finish，否则任务管理器堆积窗口
+### 8.3 重建互斥
 
-### 8.3 重建互斥（防并发多窗口）
-
-`rebuildAndWait` 用 `rebuildMutex` 互斥锁保护，防止 `pullTokenOrRebuild` 与 `TokenKeepAlive` 同时检测到 WebView 死亡并发重建：
-
-```
-rebuildMutex.withLock {
-  // 二次检查：等锁期间可能已被其他协程修好
-  if (findForHost("tywlonestop.ctwing.cn") != null) return true
-  
-  rebuildH5()          // 开新 MMWebViewUI
-  轮询 findForHost     // 等 OAuth → SPA 完成
-  finish 多余旧壳       // 窗口清理
-  moveTaskToBack 最新   // 保活
-}
-```
-
-锁顺序始终 `webViewMutex` → `rebuildMutex`（单向），无死锁。
-
-### 8.4 TokenKeepAlive (25分钟)
-
-首选: `WebViewPool.onResume()` 触发 SPA router.push → OAuth 刷新
-兜底: WebView 死亡 → `ensureReady()` 重建 → 重拉 token
-最后: `NativeHttp.basicInfo()` 滑动 TTL
+`rebuildMutex` 保护，防 `pullTokenOrRebuild` 与 `TokenKeepAlive` 并发重建：
+- 锁内二次检查（等锁期间可能已被其他协程修好）
+- forceRebuild 优先 `reloadOAuthOnPool`（不杀 H5），仅 WebView 已死才 `rebuildAndWait`
 
 ---
 
-## 九、已知陷阱清单
+## 九、Web 管理后台
 
-1. **lvbuffer CDATA**: atuserlist 值被 `<![CDATA[...]]>` 包裹, 不剥离永远不匹配
-2. **@ 空格 U+2005**: 四分之一空格, 正则需 `[\s\u2005]`
-3. **群聊 content 格式**: `wxid_xxx:@昵称 正文`, 需两次剥离
+### 9.1 HTTP Server
+
+- 零依赖 `ServerSocket` 实现，端口 60080
+- `BufferedInputStream` + 手动 `readLineBytes`（避免 BufferedReader 预读吞 POST body）
+- Cookie 不可靠，改用 `Authorization: Bearer <token>` 头验证会话
+
+### 9.2 路由
+
+| 路由 | 功能 |
+|------|------|
+| `/api/login` | 账号登录（SHA-256） |
+| `/api/status` | 服务状态（Token + TinkerGuard） |
+| `/api/diagnose` | CTWing 诊断 |
+| `/api/rebind` | CTWing 重绑 |
+| `/api/ocr` | AI OCR ICCID 识别 |
+| `/api/accounts/*` | 账号管理（list/add/delete/changepw/resetpw） |
+| `/api/selfcheck` | 自检（测试卡号 basicInfo 验证） |
+| `/api/logout` | 登出 |
+
+### 9.3 业务复用原则
+
+Web 端所有 CTWing 操作**不得**复制业务逻辑，必须复用聊天端同一套函数：
+- 查询/诊断/自检 → `nativeGetWithRetry`
+- 重绑 → `executeRebind(iccid)`
+- 续期 → `forceRebuild` + `pullToken`
+
+所有操作都在 `webViewMutex.withLock` 内执行（统一队列）。
+
+---
+
+## 十、内网穿透（自研 TCP 反向隧道）
+
+替代 frpc（16MB Go 二进制 + SELinux exec 拦截）。纯 Socket 实现：
+
+- **客户端**: `tunnel/TunnelClient.kt`（java.net.Socket，断线 5s 重连，bridge 双线程 pipe）
+- **管理器**: `tunnel/TunnelManager.kt` 生命周期管理
+- **配置**: `tunnel/TunnelConfig.kt` JSON 持久化（含 `selfCheckCard` 自检测试卡号）
+- **服务端**: `tunnel_server.py`（Python3 标准库，零依赖）部署在 NAS，systemd 开机自启
+
+协议：`AUTH <token>` → `AUTH_OK` → `REGISTER <port>` → `REGISTER_OK` → `PING`/`PONG` 心跳(35s) → `NEWCONN` → 双向 relay。
+
+---
+
+## 十一、已知陷阱清单
+
+1. **lvbuffer CDATA**: atuserlist 值被 `<![CDATA[...]]>` 包裹，不剥离永远不匹配
+2. **@ 空格 U+2005**: 四分之一空格，正则需 `[\s\u2005]`
+3. **群聊 content 格式**: `wxid_xxx:@昵称 正文`，需两次剥离
 4. **selfWxId**: `CoreAccount.getCurrentUserName()` 不可靠 → 读 SharedPreferences
 5. **SparseArray wrapper**: 存 og 不存 pg → 单参 ctor 包装
-6. **NativeHttp POST 403**: CSRF 校验, 必须走 WebView XHR
+6. **NativeHttp POST 403**: CSRF 校验，必须走 WebView XHR（重绑有 NativeHttp fallback 兜底）
 7. **pullToken 双重转义**: callJs 返回 JSON.stringify → JSONTokener 剥一层
-8. **同步 XHR 不可用**: X5 返回 status:0, 已全部改用异步
+8. **同步 XHR 不可用**: X5 返回 status:0，已全部改用异步
 9. **并发数据串扰**: lastApiResponse 全局单例 → webViewMutex 串行化
 10. **DexKit 多进程崩溃**: libdexkit.so 限单进程加载
+11. **BufferedReader 预读吞 POST body**: HTTP server 必须用 BufferedInputStream + 手动读
+12. **移动 WebView Activity 用 moveTaskToBack 不用 finish**: finish 暂停渲染器 → pullToken 超时
+13. **instanceFollowRedirects=false**: 防 token 为空时 302 重定向死循环
+14. **forceRebuild 优先 reloadOAuthOnPool**: 不杀 H5，对现有 WebView 重走 OAuth
+15. **PowerShell Set-Content 损坏 UTF-8 中文**: 含中文的 .kt 文件必须用 edit/write 工具修改
 
 ---
 
-## 十、文件地图
+## 十二、文件地图
 
 ```
 app/src/main/java/dev/example/autoreply/
@@ -404,37 +371,68 @@ app/src/main/java/dev/example/autoreply/
 │   ├── PopupMenuHook.kt         — "+"菜单注入 (DexKit → HomeUI → SparseArray)
 │   ├── WeDatabaseApi.kt         — rconversation rawQuery, isAtMe 兜底
 │   ├── AtParser.kt              — lvbuffer → msgSource → atuserlist
+│   ├── AtMentionHook.kt         — 真实 @ 通知：atuserlist 注入
 │   ├── WhitelistLauncher.kt     — ComposeView 弹窗 + XposedLifecycleOwner
 │   └── TinkerGuard.kt           — 热更新三层防护
 │
 ├── ctwing/
-│   ├── CtwingKeywordRouter.kt   — 关键词路由 + 格式化 (625行)
-│   ├── CtwingFacade.kt          — API 门面: pullToken/pollDshResult/互斥锁 (614行)
-│   ├── NativeHttp.kt            — 原生 HTTP (GET/POST/cookie/token 缓存) (165行)
-│   ├── CtwingWebViewHook.kt     — WebView 劫持 + evaluateJs (877行)
-│   ├── CtwingJsInjector.kt      — JS 注入: window.__ctwing.* (629行)
+│   ├── CtwingKeywordRouter.kt   — 关键词路由 + 格式化（含 executeRebind/nativeGetWithRetry）
+│   ├── CtwingFacade.kt          — API 门面: pullToken/forceRebuild/mutex (约 500 行)
+│   ├── NativeHttp.kt            — 原生 HTTP (GET/POST, 30/60s 超时)
+│   ├── CtwingWebViewHook.kt     — WebView 劫持 + evaluateJs
+│   ├── CtwingJsInjector.kt      — JS 注入: window.__ctwing.*
 │   ├── CtwingJsBridge.kt        — addJavascriptInterface bridge
 │   ├── CtwingCrypto.kt          — CTWing 加解密 (CTROBF1)
-│   ├── CtwingIpcBridge.kt       — 跨进程文件 IPC
+│   ├── CtwingIpcBridge.kt       — 跨进程文件 IPC（未使用）
 │   ├── CtwingNetworkHook.kt     — okhttp/Cronet 网络 hook
-│   ├── CtwingBundleCapture.kt   — SPA JS/CSS bundle 捕获
-│   ├── TokenKeepAlive.kt        — 25分钟 token 心跳 (81行)
-│   └── WebViewPool.kt           — WebView 偷取 + overlay window (201行)
+│   ├── CtwingBundleCapture.kt   — SPA bundle 捕获
+│   ├── TokenKeepAlive.kt        — 30s tick + 30min 刷新
+│   └── WebViewPool.kt           — WebView 偷取 + overlay window
+│
+├── web/
+│   ├── WebAdminServer.kt        — 内置 HTTP Server (端口 60080, 约 900 行)
+│   ├── AccountStore.kt          — 账号 CRUD (SHA-256)
+│   └── AgnesAiClient.kt         — AI OCR ICCID 识别 (agnes-3.0-flash)
+│
+├── tunnel/
+│   ├── TunnelClient.kt          — 自研 TCP 反向隧道客户端
+│   ├── TunnelManager.kt         — 生命周期管理
+│   └── TunnelConfig.kt          — JSON 配置 (含 selfCheckCard)
 │
 ├── ui/
-│   ├── WhitelistScreen.kt       — 联系人勾选 Compose UI
-│   └── WhitelistStore.kt        — JSON 文件存储
+│   ├── WhitelistScreen.kt       — 联系人勾选 Compose UI（仅微信弹窗）
+│   ├── WhitelistStore.kt        — JSON 文件存储
+│   ├── StatusScreen.kt          — 服务状态面板
+│   ├── TunnelScreen.kt          — 内网穿透配置
+│   └── TunnelLauncher.kt        — 穿透启动入口
 │
-├── trigger/
-│   ├── MessageTrigger.kt        — 正则过滤 + cooldown
-│   └── BufferedMessageTrigger.kt — debounce 聚合
-│
-├── engine/
-│   └── AutoReplyEngine.kt       — 引擎骨架 (被 MainHook 替代)
-│
-├── llm/
-│   └── OpenAiClient.kt          — OpenAI 兼容客户端 (预留)
-│
-└── media/
-    └── MediaHandler.kt          — 图片回复扩展点 (预留)
+└── trigger/
+    ├── MessageTrigger.kt        — 正则过滤 + cooldown
+    └── BufferedMessageTrigger.kt — Debounce 聚合
 ```
+
+---
+
+## 十三、硬性规则
+
+### 版本号
+
+编译时 Unix 时间戳自动生成：versionCode=Unix 秒，versionName=`yyyyMMddHHmmss`（东八区）。
+
+### 锁顺序
+
+`webViewMutex` → `rebuildMutex` 单向。禁止反向获取。
+
+### 文件修改
+
+含中文的 .kt 文件禁止用 PowerShell Set-Content/字符串替换，必须用 edit/write 工具。
+
+### Git 推送
+
+```bash
+git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push
+```
+
+### 业务复用
+
+Web 端所有 CTWing 操作必须复用聊天端同一套函数，禁止复制粘贴。
